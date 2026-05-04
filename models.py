@@ -1,9 +1,9 @@
 from pydantic import BaseModel
 
 
-class Container(BaseModel):
+class ContainerArgs(BaseModel):
     name: str
-    price: float
+    image: str
     is_offer: bool | None = None
 
 
