@@ -1,3 +1,5 @@
+from typing import Any, Dict, List, Optional
+
 import docker
 from fastapi import FastAPI
 
@@ -32,6 +34,12 @@ def list_containers(extended: bool = False):
 
 @app.get("/containers/{container_id}")
 def get_container(container_id: str):
+    container = client.containers.get(container_id)
+    return {"container": container.attrs}
+
+
+@app.post("/containers/{container_id}")
+def modify_container(container_id: str):
     container = client.containers.get(container_id)
     return {"container": container.attrs}
 
