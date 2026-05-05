@@ -3,14 +3,24 @@ from typing import Any, Dict, List, Optional
 import docker
 from fastapi import FastAPI
 
+import docker_interface as di
+from models import ContainerArgs
+
 app = FastAPI()
 client = docker.from_env()
 
 
 @app.post("/containers")
-def create_container(image: str, name: str):
-    container = client.containers.run(image, name=name, detach=True)
-    return {"container": container.attrs}
+def create_container(args: ContainerArgs):
+    c = di.create_container(args)
+    return {
+        "container": {
+            "id": c.id,
+            "name": c.name,
+            "image": c.image.tags[0] if c.image.tags else c.image.short_id,
+            "status": c.status,
+        }
+    }
 
 
 @app.get("/containers")

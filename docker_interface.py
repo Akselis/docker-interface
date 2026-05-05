@@ -9,4 +9,4 @@ client = docker.from_env()
 def create_container(args: ContainerArgs):
     kwargs = build_container_kwargs(args)
     container = client.containers.run(**kwargs)
-    return {"id": container.id}
+    return container

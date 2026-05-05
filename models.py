@@ -75,11 +75,11 @@ class ContainerArgs(BaseModel):
     image: str
     name: str
     command: str | None = None
-    env: dict[str, str] = Field(default_factory=dict)
-    ports: list[PortMapping] = Field(default_factory=list)
-    resources: ContainerResourceArgs = Field(default_factory=ContainerResourceArgs)
-    security: ContainerSecurityArgs = Field(default_factory=ContainerSecurityArgs)
-    network: list[ContainerNetworkArgs] = Field(default_factory=list)
-    storage: list[ContainerStorageMount] = Field(default_factory=list)
-    labels: dict[str, str] = Field(default_factory=dict)
-    restart_policy: RestartPolicy = Field(default_factory=RestartPolicy)
+    env: dict[str, str] | None = None
+    ports: list[PortMapping] | None = None
+    resources: ContainerResourceArgs | None = None
+    security: ContainerSecurityArgs | None = None
+    network: list[ContainerNetworkArgs] | None = None
+    storage: list[ContainerStorageMount] | None = None
+    labels: dict[str, str] | None = None
+    restart_policy: RestartPolicy | None = None
