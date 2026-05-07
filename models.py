@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 
 
 class NetworkDriver(str, Enum):
@@ -17,35 +17,35 @@ class StorageType(str, Enum):
 
 
 class ContainerResourceArgs(BaseModel):
-    cpu_count: int = 1
-    memory_limit: str = "512m"
-    process_limit: int = 100
+    cpu_count: int | None = None
+    memory_limit: str | None = None
+    process_limit: int | None = None
 
 
 class ContainerNetworkArgs(BaseModel):
     name: str
-    external: bool = False
-    driver: NetworkDriver = NetworkDriver.BRIDGE
-    aliases: list[str] = Field(default_factory=list)
+    external: bool | None = None
+    driver: NetworkDriver | None = None
+    aliases: list[str] | None = None
 
 
 class ContainerStorageMount(BaseModel):
     source: str
     target: str
-    type: StorageType = StorageType.BIND
-    read_only_mount: bool = True
+    type: StorageType
+    read_only_mount: bool
 
 
 class RestartPolicy(BaseModel):
-    name: str = "on-failure"
+    name: str | None = None
     retries: int | None = None
-    delay: int = 0
+    delay: int | None = None
 
 
 class PortMapping(BaseModel):
     host: int
     container: int
-    protocol: str = "tcp"
+    protocol: str
 
     @field_validator("host", "container")
     @classmethod
@@ -56,19 +56,15 @@ class PortMapping(BaseModel):
 
 
 class ContainerSecurityArgs(BaseModel):
-    user: str = "1000:1000"  # default user
-    read_only_root_fs: bool = True  # container's root filesystem cannot be modified
-    no_new_privileges: bool = True  # container cannot gain new privileges
-    capabilities_drop: list[str] = Field(default_factory=lambda: ["ALL"])
-    capabilities_add: list[str] = Field(
-        default_factory=list
-    )  # capabilities to add to the container
-    privileged: bool = False  # root access
-    devices: list[str] = Field(
-        default_factory=list
-    )  # exposes hardware, kernel interfaces
-    seccomp_profile: str = "default"
-    apparmor_profile: str = "docker-default"
+    user: str | None = None
+    read_only_root_fs: bool | None = None
+    no_new_privileges: bool | None = None
+    capabilities_drop: list[str] | None = None
+    capabilities_add: list[str] | None = None
+    privileged: bool | None = None
+    devices: list[str] | None = None
+    seccomp_profile: str | None = None
+    apparmor_profile: str | None = None
 
 
 class ContainerArgs(BaseModel):

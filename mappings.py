@@ -9,19 +9,19 @@ class ContainerRunKwargs(TypedDict):
     image: str
     name: str
     command: NotRequired[str | None]
-    environment: NotRequired[dict[str, str] | None]
-    ports: NotRequired[dict[str, int] | None]
+    environment: NotRequired[dict[str, str]]
+    ports: NotRequired[dict[str, int]]
     cpu_quota: NotRequired[int]
     mem_limit: NotRequired[str]
+    user: NotRequired[str]
     read_only: NotRequired[bool]
     privileged: NotRequired[bool]
     cap_drop: NotRequired[list[str]]
     cap_add: NotRequired[list[str]]
     devices: NotRequired[list[str]]
     security_opt: NotRequired[list[str]]
-    network_disabled: NotRequired[bool]
-    labels: NotRequired[dict[str, str] | None]
-    mounts: NotRequired[list[Mount] | None]
+    labels: NotRequired[dict[str, str]]
+    mounts: NotRequired[list[Mount]]
 
 
 def build_ports(ports: list[PortMapping] | None) -> dict[str, int] | None:
@@ -35,6 +35,20 @@ def build_ports(ports: list[PortMapping] | None) -> dict[str, int] | None:
         port_dict[port_key] = p.host
 
     return port_dict
+
+
+def build_security_opts(
+    seccomp_profile: str | None, apparmor_profile: str | None
+) -> list[str] | None:
+    opts: list[str] = []
+
+    if seccomp_profile is not None and seccomp_profile != "default":
+        opts.append(f"seccomp={seccomp_profile}")
+
+    if apparmor_profile is not None:
+        opts.append(f"apparmor={apparmor_profile}")
+
+    return opts or None
 
 
 def build_mounts(storage: list[ContainerStorageMount] | None) -> list[Mount] | None:
@@ -70,24 +84,31 @@ def build_container_kwargs(args: ContainerArgs) -> ContainerRunKwargs:
         kwargs["ports"] = ports
 
     if args.resources is not None:
-        kwargs["cpu_quota"] = args.resources.cpu_count * 100000
-        kwargs["mem_limit"] = args.resources.memory_limit
+        if args.resources.cpu_count is not None:
+            kwargs["cpu_quota"] = args.resources.cpu_count * 100000
+        if args.resources.memory_limit is not None:
+            kwargs["mem_limit"] = args.resources.memory_limit
 
     if args.security is not None:
-        kwargs["read_only"] = args.security.read_only_root_fs
-        kwargs["privileged"] = args.security.privileged
-        kwargs["cap_drop"] = args.security.capabilities_drop
-        kwargs["cap_add"] = args.security.capabilities_add
-        kwargs["devices"] = args.security.devices
-        kwargs["security_opt"] = [
-            *(
-                [f"seccomp={args.security.seccomp_profile}"]
-                if args.security.seccomp_profile != "default"
-                else []
-            ),
-            f"apparmor={args.security.apparmor_profile}",
-        ]
-        kwargs["network_disabled"] = False
+        if args.security.user is not None:
+            kwargs["user"] = args.security.user
+        if args.security.read_only_root_fs is not None:
+            kwargs["read_only"] = args.security.read_only_root_fs
+        if args.security.privileged is not None:
+            kwargs["privileged"] = args.security.privileged
+        if args.security.capabilities_drop is not None:
+            kwargs["cap_drop"] = args.security.capabilities_drop
+        if args.security.capabilities_add is not None:
+            kwargs["cap_add"] = args.security.capabilities_add
+        if args.security.devices is not None:
+            kwargs["devices"] = args.security.devices
+
+        security_opt = build_security_opts(
+            seccomp_profile=args.security.seccomp_profile,
+            apparmor_profile=args.security.apparmor_profile,
+        )
+        if security_opt is not None:
+            kwargs["security_opt"] = security_opt
 
     if args.labels is not None:
         kwargs["labels"] = args.labels
