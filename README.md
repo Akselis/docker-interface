@@ -1,10 +1,6 @@
 # Docker Interface API
 
-## Build image
-
-```/dev/null/commands.sh#L1-1
-docker build -t docker-interface-api .
-```
+Hello, I'm Gustas and this is a lightweight API for managing docker infrastructure. Used for my Bachelor's project.
 
 ## Run container
 
