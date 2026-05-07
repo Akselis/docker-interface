@@ -1,3 +1,5 @@
+import hmac
+import os
 from typing import Literal
 
 from docker.errors import (
@@ -8,13 +10,32 @@ from docker.errors import (
     NotFound,
 )
 from docker.models.containers import Container
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
 import docker_interface as di
 from models import ContainerArgs
 
-app = FastAPI()
+API_KEY_ENV_VAR = "DOCKER_INTERFACE_API_KEY"
+API_KEY_HEADER = "X-API-Key"
+
+
+def verify_api_key(x_api_key: str = Header(..., alias=API_KEY_HEADER)) -> None:
+    expected_api_key = os.getenv(API_KEY_ENV_VAR)
+    if not expected_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Server API key is not configured in {API_KEY_ENV_VAR}",
+        )
+
+    if not hmac.compare_digest(x_api_key, expected_api_key):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+        )
+
+
+app = FastAPI(dependencies=[Depends(verify_api_key)])
 
 
 class ExecCommandRequest(BaseModel):
@@ -311,82 +332,6 @@ def set_container_state(
 ):
     try:
         container = di.set_container_state(container_id, state)
-        return {"container": _container_summary(container)}
-    except NotFound as exc:
-        raise HTTPException(
-            status_code=404, detail=f"Container not found: {container_id}"
-        ) from exc
-    except APIError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker API error: {exc.explanation}"
-        ) from exc
-    except DockerException as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker client error: {str(exc)}"
-        ) from exc
-
-
-@app.post("/containers/{container_id}/stop")
-def stop_container(container_id: str):
-    try:
-        container = di.stop_container(container_id)
-        return {"container": _container_summary(container)}
-    except NotFound as exc:
-        raise HTTPException(
-            status_code=404, detail=f"Container not found: {container_id}"
-        ) from exc
-    except APIError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker API error: {exc.explanation}"
-        ) from exc
-    except DockerException as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker client error: {str(exc)}"
-        ) from exc
-
-
-@app.post("/containers/{container_id}/pause")
-def pause_container(container_id: str):
-    try:
-        container = di.pause_container(container_id)
-        return {"container": _container_summary(container)}
-    except NotFound as exc:
-        raise HTTPException(
-            status_code=404, detail=f"Container not found: {container_id}"
-        ) from exc
-    except APIError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker API error: {exc.explanation}"
-        ) from exc
-    except DockerException as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker client error: {str(exc)}"
-        ) from exc
-
-
-@app.post("/containers/{container_id}/unpause")
-def unpause_container(container_id: str):
-    try:
-        container = di.set_container_state(container_id, "unpause")
-        return {"container": _container_summary(container)}
-    except NotFound as exc:
-        raise HTTPException(
-            status_code=404, detail=f"Container not found: {container_id}"
-        ) from exc
-    except APIError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker API error: {exc.explanation}"
-        ) from exc
-    except DockerException as exc:
-        raise HTTPException(
-            status_code=500, detail=f"Docker client error: {str(exc)}"
-        ) from exc
-
-
-@app.post("/containers/{container_id}/start")
-def start_container(container_id: str):
-    try:
-        container = di.start_container(container_id)
         return {"container": _container_summary(container)}
     except NotFound as exc:
         raise HTTPException(
