@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  control-plane:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DB_URL: postgresql+psycopg2://lab:lab@db:5432/labdb
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: lab
+      POSTGRES_PASSWORD: lab
+      POSTGRES_DB: labdb
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+volumes:
+  pgdata:
