@@ -79,3 +79,29 @@ class ContainerArgs(BaseModel):
     storage: list[ContainerStorageMount] | None = None
     labels: dict[str, str] | None = None
     restart_policy: RestartPolicy | None = None
+
+
+class NetworkIpamArgs(BaseModel):
+    subnet: str | None = None
+    gateway: str | None = None
+    ip_range: str | None = None
+
+
+class NetworkCreateArgs(BaseModel):
+    name: str
+    driver: NetworkDriver | None = None
+    internal: bool | None = None
+    attachable: bool | None = None
+    labels: dict[str, str] | None = None
+    ipam: NetworkIpamArgs | None = None
+
+
+class NetworkConnectArgs(BaseModel):
+    container_id: str
+    aliases: list[str] | None = None
+    ipv4_address: str | None = None
+
+
+class NetworkDisconnectArgs(BaseModel):
+    container_id: str
+    force: bool = False

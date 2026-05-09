@@ -10,11 +10,17 @@ from docker.errors import (
     NotFound,
 )
 from docker.models.containers import Container
+from docker.models.networks import Network
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 
 import docker_interface as di
-from models import ContainerArgs
+from models import (
+    ContainerArgs,
+    NetworkConnectArgs,
+    NetworkCreateArgs,
+    NetworkDisconnectArgs,
+)
 
 API_KEY_ENV_VAR = "DOCKER_INTERFACE_API_KEY"
 API_KEY_HEADER = "X-API-Key"
@@ -264,6 +270,39 @@ def _container_summary(container: Container, full: bool = False) -> dict[str, ob
     return full_payload
 
 
+def _network_summary(network: Network, full: bool = False) -> dict[str, object]:
+    attrs_obj = network.attrs
+    attrs = attrs_obj if isinstance(attrs_obj, dict) else {}
+
+    labels_obj = attrs.get("Labels")
+    labels: dict[str, str] = {}
+    if isinstance(labels_obj, dict):
+        for k, v in labels_obj.items():
+            if isinstance(k, str) and isinstance(v, str):
+                labels[k] = v
+
+    containers_obj = attrs.get("Containers")
+    container_ids: list[str] = []
+    if isinstance(containers_obj, dict):
+        container_ids = [str(cid) for cid in containers_obj.keys()]
+
+    summary: dict[str, object] = {
+        "id": str(attrs.get("Id") or network.id),
+        "name": str(attrs.get("Name") or network.name),
+        "driver": str(attrs.get("Driver") or "unknown"),
+        "scope": str(attrs.get("Scope") or "unknown"),
+        "internal": bool(attrs.get("Internal") is True),
+        "labels": labels,
+        "containers": container_ids,
+    }
+
+    if not full:
+        return summary
+
+    summary["attrs"] = attrs
+    return summary
+
+
 @app.post("/containers")
 def create_container(args: ContainerArgs):
     try:
@@ -386,6 +425,127 @@ def destroy_container(container_id: str, force: bool = True):
     except NotFound as exc:
         raise HTTPException(
             status_code=404, detail=f"Container not found: {container_id}"
+        ) from exc
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.post("/networks")
+def create_network(args: NetworkCreateArgs):
+    try:
+        network = di.create_network(args)
+        return {"network": _network_summary(network)}
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.get("/networks")
+def list_networks(full: bool = False):
+    try:
+        networks = di.get_networks()
+        return [{"network": _network_summary(n, full=full)} for n in networks]
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.get("/networks/{network_id}")
+def get_network(network_id: str, full: bool = False):
+    try:
+        network = di.get_network(network_id)
+        return {"network": _network_summary(network, full=full)}
+    except NotFound as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Network not found: {network_id}"
+        ) from exc
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.post("/networks/{network_id}/connect")
+def connect_container_to_network(network_id: str, payload: NetworkConnectArgs):
+    try:
+        network = di.connect_container_to_network(network_id, payload)
+        return {"network": _network_summary(network)}
+    except NotFound as exc:
+        raise HTTPException(
+            status_code=404, detail="Network or container not found"
+        ) from exc
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.post("/networks/{network_id}/disconnect")
+def disconnect_container_from_network(network_id: str, payload: NetworkDisconnectArgs):
+    try:
+        network = di.disconnect_container_from_network(network_id, payload)
+        return {"network": _network_summary(network)}
+    except NotFound as exc:
+        raise HTTPException(
+            status_code=404, detail="Network or container not found"
+        ) from exc
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.post("/networks/prune")
+def prune_networks():
+    try:
+        result = di.prune_networks()
+        return {"result": result}
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.delete("/networks/{network_id}")
+def destroy_network(network_id: str):
+    try:
+        di.destroy_network(network_id)
+        return {"status": "removed", "network_id": network_id}
+    except NotFound as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Network not found: {network_id}"
         ) from exc
     except APIError as exc:
         raise HTTPException(
