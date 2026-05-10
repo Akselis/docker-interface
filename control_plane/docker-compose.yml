@@ -1,25 +1,55 @@
-version: "3.9"
-
 services:
-  control-plane:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      DB_URL: postgresql+psycopg2://lab:lab@db:5432/labdb
-    depends_on:
-      - db
-
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: lab
-      POSTGRES_PASSWORD: lab
-      POSTGRES_DB: labdb
+      POSTGRES_DB: control_plane
+      POSTGRES_USER: control_plane
+      POSTGRES_PASSWORD: control_plane
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U control_plane -d control_plane"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - db_data:/var/lib/postgresql/data
+
+  migrate:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    working_dir: /app/control_plane
+    environment:
+      DB_URL: postgresql+asyncpg://control_plane:control_plane@db:5432/control_plane
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["sh", "/app/control_plane/scripts/migrate.sh"]
+    volumes:
+      - ./alembic:/app/control_plane/alembic
+      - ./alembic.ini:/app/control_plane/alembic.ini
+      - ./scripts:/app/control_plane/scripts
+      - ./db/models:/app/control_plane/db/models
+    restart: "no"
+
+  control_plane:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    working_dir: /app/control_plane
+    environment:
+      DB_URL: postgresql+asyncpg://control_plane:control_plane@db:5432/control_plane
+      DOCKER_INTERFACE_API_KEY: your-key
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
-      - "5432:5432"
+      - "8000:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    command:
+      ["uvicorn", "controller:app", "--host", "0.0.0.0", "--port", "8000"]
 
 volumes:
-  pgdata:
+  db_data:

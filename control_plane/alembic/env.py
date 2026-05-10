@@ -8,6 +8,7 @@ from logging.config import fileConfig
 from constants.const import DATABASE_URL_ENV_VAR
 from db.models import Base
 from sqlalchemy import engine_from_config, pool
+from sqlalchemy.engine import make_url
 
 context = import_module("alembic.context")
 
@@ -16,10 +17,29 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
+
+def _to_alembic_sync_url(db_url: str) -> str:
+    parsed = make_url(db_url)
+
+    sync_driver_by_input_driver = {
+        "postgresql": "postgresql+psycopg",
+        "postgresql+asyncpg": "postgresql+psycopg",
+        "postgresql+psycopg2": "postgresql+psycopg",
+        "mysql": "mysql+pymysql",
+        "mysql+aiomysql": "mysql+pymysql",
+        "sqlite+aiosqlite": "sqlite",
+    }
+
+    if parsed.drivername in sync_driver_by_input_driver:
+        parsed = parsed.set(drivername=sync_driver_by_input_driver[parsed.drivername])
+
+    return parsed.render_as_string(hide_password=False)
+
+
 # Prefer DB_URL from environment and fall back to alembic.ini url if set.
 db_url = os.getenv(DATABASE_URL_ENV_VAR)
 if db_url:
-    config.set_main_option("sqlalchemy.url", db_url)
+    config.set_main_option("sqlalchemy.url", _to_alembic_sync_url(db_url))
 
 target_metadata = Base.metadata
 
