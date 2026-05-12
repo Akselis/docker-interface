@@ -9,3 +9,4 @@ psycopg[binary]==3.2.3
 aiomysql==0.2.0
 pymysql==1.1.1
 aiosqlite==0.20.0
+pika==1.3.2

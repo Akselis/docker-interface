@@ -105,3 +105,47 @@ class NetworkConnectArgs(BaseModel):
 class NetworkDisconnectArgs(BaseModel):
     container_id: str
     force: bool = False
+
+
+class ComposeSourceType(str, Enum):
+    GIT = "git"
+    ARCHIVE = "archive"
+    INLINE = "inline"
+
+
+class ComposeDeployArgs(BaseModel):
+    project_name: str
+    source_type: ComposeSourceType
+    source_url: str | None = None
+    ref: str | None = None
+    compose_file: str = "docker-compose.yml"
+    compose_content: str | None = None
+    env: dict[str, str] | None = None
+    pull: bool = True
+    build: bool = False
+
+
+class ComposeActionArgs(BaseModel):
+    env: dict[str, str] | None = None
+    remove_volumes: bool = False
+    remove_images: bool = False
+    timeout_seconds: int = 120
+
+
+class ComposeLogsArgs(BaseModel):
+    tail: int = 200
+    follow: bool = False
+
+
+class VolumeCreateArgs(BaseModel):
+    name: str
+    driver: str | None = None
+    labels: dict[str, str] | None = None
+
+
+class ExecCommandRequest(BaseModel):
+    command: str | list[str]
+    workdir: str | None = None
+    user: str | None = None
+    environment: dict[str, str] | None = None
+    privileged: bool = False

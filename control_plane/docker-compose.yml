@@ -31,6 +31,28 @@ services:
       - ./db/models:/app/control_plane/db/models
     restart: "no"
 
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
   control_plane:
     build:
       context: .
@@ -39,11 +61,17 @@ services:
     environment:
       DB_URL: postgresql+asyncpg://control_plane:control_plane@db:5432/control_plane
       DOCKER_INTERFACE_API_KEY: your-key
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      RABBITMQ_EXCHANGE: lab.events
+      RABBITMQ_QUEUE: control_plane.heartbeats
+      RABBITMQ_ROUTING_KEY_PATTERN: heartbeat.*
     depends_on:
       db:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      rabbitmq:
+        condition: service_started
     ports:
       - "8000:8000"
     volumes:
@@ -53,3 +81,4 @@ services:
 
 volumes:
   db_data:
+  pgadmin_data:
