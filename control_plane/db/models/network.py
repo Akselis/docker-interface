@@ -9,30 +9,27 @@ from sqlalchemy.types import DateTime
 from .base import Base
 
 
-class ContainerStatus(str, Enum):
-    CREATED = "created"
-    STARTED = "started"
-    STOPPED = "stopped"
-    PAUSED = "paused"
-    FAILED = "failed"
+class NetworkDriver(str, Enum):
+    BRIDGE = "bridge"
+    OVERLAY = "overlay"
 
 
-class Container(Base):
-    __tablename__ = "containers"
+class Network(Base):
+    __tablename__ = "networks"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    container_id: Mapped[str] = mapped_column(nullable=False, unique=True)
-    image: Mapped[str] = mapped_column(nullable=False)
+    network_id: Mapped[str] = mapped_column(nullable=False, unique=True)
+    name: Mapped[str] = mapped_column(nullable=False)
     lab_id: Mapped[int] = mapped_column(
         ForeignKey("labs.id", ondelete="CASCADE"),
         nullable=False,
         unique=False,
         index=True,
     )
-    status: Mapped[ContainerStatus] = mapped_column(
-        SAEnum(ContainerStatus, name="container_status_enum"),
+    driver: Mapped[NetworkDriver] = mapped_column(
+        SAEnum(NetworkDriver, name="network_driver_enum"),
         nullable=False,
-        default=ContainerStatus.CREATED,
+        default=NetworkDriver.BRIDGE,
     )
     cpu_limit: Mapped[int] = mapped_column(nullable=False)
     memory_limit_mb: Mapped[int] = mapped_column(nullable=False)
