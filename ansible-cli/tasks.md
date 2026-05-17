@@ -1,6 +1,0 @@
-- Manipulate containers
-  - Create
-  - Destroy
--Manipulate networks
-  - 
-- Reverse proxy
