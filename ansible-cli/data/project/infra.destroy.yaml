@@ -1,0 +1,38 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    terraform_workdir: "{{ terraform_workdir | default('.') }}"
+    terraform_workspace: "{{ terraform_workspace | default('default') }}"
+    terraform_var_file: "{{ terraform_var_file | default('') }}"
+    terraform_auto_approve: "{{ terraform_auto_approve | default(true) }}"
+
+  tasks:
+    - name: Terraform init
+      ansible.builtin.command:
+        cmd: terraform init -input=false
+        chdir: "{{ terraform_workdir }}"
+
+    - name: Terraform workspace select
+      ansible.builtin.command:
+        cmd: terraform workspace select {{ terraform_workspace }}
+        chdir: "{{ terraform_workdir }}"
+
+    - name: Terraform destroy with var-file
+      ansible.builtin.command:
+        cmd: >-
+          terraform destroy -input=false
+          {% if terraform_auto_approve %}-auto-approve{% endif %}
+          -var-file={{ terraform_var_file }}
+        chdir: "{{ terraform_workdir }}"
+      when: terraform_var_file | length > 0
+
+    - name: Terraform destroy without var-file
+      ansible.builtin.command:
+        cmd: >-
+          terraform destroy -input=false
+          {% if terraform_auto_approve %}-auto-approve{% endif %}
+        chdir: "{{ terraform_workdir }}"
+      when: terraform_var_file | length == 0

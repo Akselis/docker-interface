@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 
 from sqlalchemy import Enum as SAEnum
@@ -15,7 +15,6 @@ class ContainerStatus(str, Enum):
     STARTED = "started"
     STOPPED = "stopped"
     PAUSED = "paused"
-    FAILED = "failed"
 
 
 class Container(Base):
@@ -36,17 +35,17 @@ class Container(Base):
         nullable=False,
         default=ContainerStatus.CREATED,
     )
-    cpu_limit: Mapped[int] = mapped_column(nullable=False)
-    memory_limit_mb: Mapped[int] = mapped_column(nullable=False)
+    cpu_limit: Mapped[int | None] = mapped_column(nullable=True)
+    memory_limit_mb: Mapped[int | None] = mapped_column(nullable=True)
     lifetime_type: Mapped[LifetimeType] = mapped_column(
         SAEnum(LifetimeType, name="lifetime_type_enum"),
         nullable=False,
         default=LifetimeType.EPHEMERAL,
     )
-    time_to_live_seconds: Mapped[int] = mapped_column(nullable=True)
+    time_to_live_seconds: Mapped[int | None] = mapped_column(nullable=True)
     created_at_utc: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=lambda: datetime.now(UTC)
+        DateTime, nullable=False, default=lambda: datetime.utcnow()
     )
     last_seen_utc: Mapped[datetime] = mapped_column(
-        DateTime, nullable=False, default=lambda: datetime.now(UTC)
+        DateTime, nullable=False, default=lambda: datetime.utcnow()
     )

@@ -392,7 +392,7 @@ def destroy_network(network_id: str):
 def deploy_compose(payload: ComposeDeployArgs):
     try:
         result = di.deploy_compose_package(payload)
-        return {"deployment": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -407,7 +407,7 @@ def deploy_compose(payload: ComposeDeployArgs):
 def compose_up(project_name: str, payload: ComposeActionArgs | None = None):
     try:
         result = di.compose_up(project_name, payload)
-        return {"result": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -422,7 +422,7 @@ def compose_up(project_name: str, payload: ComposeActionArgs | None = None):
 def compose_down(project_name: str, payload: ComposeActionArgs | None = None):
     try:
         result = di.compose_down(project_name, payload)
-        return {"result": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -437,7 +437,7 @@ def compose_down(project_name: str, payload: ComposeActionArgs | None = None):
 def compose_pull(project_name: str, payload: ComposeActionArgs | None = None):
     try:
         result = di.compose_pull(project_name, payload)
-        return {"result": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -452,7 +452,7 @@ def compose_pull(project_name: str, payload: ComposeActionArgs | None = None):
 def compose_ps(project_name: str):
     try:
         result = di.compose_ps(project_name)
-        return {"result": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -467,7 +467,7 @@ def compose_ps(project_name: str):
 def compose_logs(project_name: str, payload: ComposeLogsArgs | None = None):
     try:
         result = di.compose_logs(project_name, payload)
-        return {"result": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:
@@ -482,7 +482,7 @@ def compose_logs(project_name: str, payload: ComposeLogsArgs | None = None):
 def destroy_compose(project_name: str, remove_volumes: bool = False):
     try:
         result = di.destroy_compose_project(project_name, remove_volumes=remove_volumes)
-        return {"result": result}
+        return {"project": result}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except FileNotFoundError as exc:

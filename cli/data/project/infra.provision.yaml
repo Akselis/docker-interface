@@ -1,0 +1,67 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    terraform_workdir: .
+    terraform_workspace: default
+    terraform_var_file: ""
+    terraform_auto_approve: true
+    terraform_output_file: data/artifacts/terraform_output.json
+
+  tasks:
+    - name: Ensure terraform output directory exists
+      ansible.builtin.file:
+        path: "{{ terraform_output_file | dirname }}"
+        state: directory
+        mode: "0755"
+
+    - name: Terraform init
+      ansible.builtin.command:
+        cmd: terraform init -input=false
+        chdir: "{{ terraform_workdir }}"
+
+    - name: Terraform workspace select
+      ansible.builtin.command:
+        cmd: terraform workspace select {{ terraform_workspace }}
+        chdir: "{{ terraform_workdir }}"
+      register: terraform_workspace_select
+      failed_when: false
+      changed_when: false
+
+    - name: Terraform workspace create when missing
+      ansible.builtin.command:
+        cmd: terraform workspace new {{ terraform_workspace }}
+        chdir: "{{ terraform_workdir }}"
+      when: terraform_workspace_select.rc != 0
+
+    - name: Terraform apply with var-file
+      ansible.builtin.command:
+        cmd: >-
+          terraform apply -input=false
+          {% if terraform_auto_approve %}-auto-approve{% endif %}
+          -var-file={{ terraform_var_file }}
+        chdir: "{{ terraform_workdir }}"
+      when: terraform_var_file | length > 0
+
+    - name: Terraform apply without var-file
+      ansible.builtin.command:
+        cmd: >-
+          terraform apply -input=false
+          {% if terraform_auto_approve %}-auto-approve{% endif %}
+        chdir: "{{ terraform_workdir }}"
+      when: terraform_var_file | length == 0
+
+    - name: Collect terraform outputs as json
+      ansible.builtin.command:
+        cmd: terraform output -json
+        chdir: "{{ terraform_workdir }}"
+      register: terraform_output
+      changed_when: false
+
+    - name: Write terraform output json to artifact file
+      ansible.builtin.copy:
+        dest: "{{ terraform_output_file }}"
+        content: "{{ terraform_output.stdout }}"
+        mode: "0644"

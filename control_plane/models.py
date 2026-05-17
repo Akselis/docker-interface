@@ -1,6 +1,13 @@
-from enum import Enum
+from __future__ import annotations
 
-from pydantic import BaseModel, field_validator
+from enum import Enum
+from typing import Literal
+
+from db.models.host import HostStatus
+from db.models.lab import LabStatus
+from db.models.project import ComposeSourceType
+from db.models.shared import LifetimeType
+from pydantic import BaseModel, Field, field_validator
 
 
 class NetworkDriver(str, Enum):
@@ -20,6 +27,13 @@ class ContainerResourceArgs(BaseModel):
     cpu_count: int | None = None
     memory_limit: str | None = None
     process_limit: int | None = None
+
+    @field_validator("cpu_count", "process_limit")
+    @classmethod
+    def validate_positive_ints(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("Value must be greater than 0")
+        return value
 
 
 class ContainerNetworkArgs(BaseModel):
@@ -49,10 +63,10 @@ class PortMapping(BaseModel):
 
     @field_validator("host", "container")
     @classmethod
-    def validate_port(cls, v: int) -> int:
-        if not (1 <= v <= 65535):
+    def validate_port(cls, value: int) -> int:
+        if not (1 <= value <= 65535):
             raise ValueError("Invalid port range")
-        return v
+        return value
 
 
 class ContainerSecurityArgs(BaseModel):
@@ -67,7 +81,7 @@ class ContainerSecurityArgs(BaseModel):
     apparmor_profile: str | None = None
 
 
-class ContainerArgs(BaseModel):
+class DeployEnvironmentRequest(BaseModel):
     image: str
     name: str
     command: str | None = None
@@ -80,40 +94,49 @@ class ContainerArgs(BaseModel):
     labels: dict[str, str] | None = None
     restart_policy: RestartPolicy | None = None
 
+    lifetime_type: LifetimeType = LifetimeType.EPHEMERAL
+    time_to_live_seconds: int | None = None
 
-class NetworkIpamArgs(BaseModel):
-    subnet: str | None = None
-    gateway: str | None = None
-    ip_range: str | None = None
-
-
-class NetworkCreateArgs(BaseModel):
-    name: str
-    driver: NetworkDriver | None = None
-    internal: bool | None = None
-    attachable: bool | None = None
-    labels: dict[str, str] | None = None
-    ipam: NetworkIpamArgs | None = None
+    @field_validator("time_to_live_seconds")
+    @classmethod
+    def validate_ttl(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("time_to_live_seconds must be greater than 0")
+        return value
 
 
-class NetworkConnectArgs(BaseModel):
-    container_id: str
-    aliases: list[str] | None = None
-    ipv4_address: str | None = None
+class RegisterHostRequest(BaseModel):
+    hostname: str = Field(min_length=1, max_length=100)
+    ip_address: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=8000, ge=1, le=65535)
+    scheme: Literal["http", "https"] = "http"
+    status: HostStatus = HostStatus.ONLINE
+    cpu_total: int = Field(ge=0)
+    memory_total_mb: int = Field(ge=0)
+    api_key: str = Field(min_length=1)
 
 
-class NetworkDisconnectArgs(BaseModel):
-    container_id: str
-    force: bool = False
+class CallLabHostRequest(BaseModel):
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"]
+    endpoint_path: str = Field(min_length=1)
+    query: dict[str, str] | None = None
+    json_body: object | None = None
+    timeout_seconds: float = Field(default=15.0, gt=0, le=120.0)
 
 
-class ComposeSourceType(str, Enum):
-    GIT = "git"
-    ARCHIVE = "archive"
-    INLINE = "inline"
+class CreateLabRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    host_id: int = Field(gt=0)
+    cpu_limit: int | None = Field(default=None, ge=0)
+    memory_limit_mb: int | None = Field(default=None, ge=0)
+    status: LabStatus = LabStatus.STOPPED
 
 
-class ComposeDeployArgs(BaseModel):
+class NameListRequest(BaseModel):
+    names: list[str] = Field(min_length=1)
+
+
+class ComposeDeployRequest(BaseModel):
     project_name: str
     source_type: ComposeSourceType
     source_url: str | None = None
@@ -139,29 +162,3 @@ class ComposeDeployArgs(BaseModel):
         if value is not None and not value.strip():
             raise ValueError("memory_limit cannot be empty")
         return value
-
-
-class ComposeActionArgs(BaseModel):
-    env: dict[str, str] | None = None
-    remove_volumes: bool = False
-    remove_images: bool = False
-    timeout_seconds: int = 120
-
-
-class ComposeLogsArgs(BaseModel):
-    tail: int = 200
-    follow: bool = False
-
-
-class VolumeCreateArgs(BaseModel):
-    name: str
-    driver: str | None = None
-    labels: dict[str, str] | None = None
-
-
-class ExecCommandRequest(BaseModel):
-    command: str | list[str]
-    workdir: str | None = None
-    user: str | None = None
-    environment: dict[str, str] | None = None
-    privileged: bool = False

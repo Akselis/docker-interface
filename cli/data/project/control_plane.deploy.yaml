@@ -1,0 +1,141 @@
+---
+- hosts: "{{ target_host }}"
+  become: true
+
+  vars:
+    control_plane_network_name: control-plane
+
+    control_plane_image: control-plane:latest
+    control_plane_container_name: control-plane-api
+    control_plane_host_port: 8001
+    control_plane_container_port: 8001
+
+    control_plane_db_container_name: control-plane-db
+    control_plane_db_image: postgres:16
+    control_plane_db_name: control_plane
+    control_plane_db_user: control_plane
+    control_plane_db_password: control_plane
+    control_plane_db_volume: /opt/control_plane/db_data
+
+    control_plane_rabbitmq_container_name: control-plane-rabbitmq
+    control_plane_rabbitmq_image: rabbitmq:3-management
+    control_plane_rabbitmq_user: guest
+    control_plane_rabbitmq_password: guest
+    control_plane_rabbitmq_host_port: 5672
+    control_plane_rabbitmq_management_port: 15672
+
+    control_plane_api_key: change-me
+
+    control_plane_db_url: "postgresql+asyncpg://{{ control_plane_db_user }}:{{ control_plane_db_password }}@{{ control_plane_db_container_name }}:5432/{{ control_plane_db_name }}"
+    control_plane_rabbitmq_url: "amqp://{{ control_plane_rabbitmq_user }}:{{ control_plane_rabbitmq_password }}@{{ control_plane_rabbitmq_container_name }}:5672/%2F"
+
+  pre_tasks:
+    - name: Ensure control plane API key is provided
+      ansible.builtin.assert:
+        that:
+          - control_plane_api_key is defined
+          - control_plane_api_key | string | length > 0
+        fail_msg: "Set control_plane_api_key when running this playbook."
+
+  tasks:
+    - name: Ensure control plane network exists
+      community.docker.docker_network:
+        name: "{{ control_plane_network_name }}"
+        state: present
+
+    - name: Ensure postgres data directory exists
+      ansible.builtin.file:
+        path: "{{ control_plane_db_volume }}"
+        state: directory
+        mode: "0755"
+
+    - name: Run PostgreSQL container
+      community.docker.docker_container:
+        name: "{{ control_plane_db_container_name }}"
+        image: "{{ control_plane_db_image }}"
+        state: started
+        restart_policy: unless-stopped
+        networks:
+          - name: "{{ control_plane_network_name }}"
+        env:
+          POSTGRES_DB: "{{ control_plane_db_name }}"
+          POSTGRES_USER: "{{ control_plane_db_user }}"
+          POSTGRES_PASSWORD: "{{ control_plane_db_password }}"
+        volumes:
+          - "{{ control_plane_db_volume }}:/var/lib/postgresql/data"
+        healthcheck:
+          test:
+            - CMD-SHELL
+            - pg_isready -U {{ control_plane_db_user }} -d {{ control_plane_db_name }}
+          interval: 5s
+          timeout: 3s
+          retries: 20
+
+    - name: Wait for PostgreSQL container to become healthy
+      community.docker.docker_container_info:
+        name: "{{ control_plane_db_container_name }}"
+      register: control_plane_db_info
+      until: >-
+        control_plane_db_info.container is defined and
+        control_plane_db_info.container.State is defined and
+        control_plane_db_info.container.State.Health is defined and
+        control_plane_db_info.container.State.Health.Status == 'healthy'
+      retries: 20
+      delay: 3
+
+    - name: Run RabbitMQ container
+      community.docker.docker_container:
+        name: "{{ control_plane_rabbitmq_container_name }}"
+        image: "{{ control_plane_rabbitmq_image }}"
+        state: started
+        restart_policy: unless-stopped
+        networks:
+          - name: "{{ control_plane_network_name }}"
+        env:
+          RABBITMQ_DEFAULT_USER: "{{ control_plane_rabbitmq_user }}"
+          RABBITMQ_DEFAULT_PASS: "{{ control_plane_rabbitmq_password }}"
+        published_ports:
+          - "{{ control_plane_rabbitmq_host_port }}:5672"
+          - "{{ control_plane_rabbitmq_management_port }}:15672"
+
+    - name: Run control plane migrations
+      community.docker.docker_container:
+        name: control-plane-migrate
+        image: "{{ control_plane_image }}"
+        state: started
+        auto_remove: true
+        detach: false
+        command:
+          - sh
+          - /app/control_plane/scripts/migrate.sh
+        networks:
+          - name: "{{ control_plane_network_name }}"
+        env:
+          DB_URL: "{{ control_plane_db_url }}"
+
+    - name: Run control plane API container
+      community.docker.docker_container:
+        name: "{{ control_plane_container_name }}"
+        image: "{{ control_plane_image }}"
+        state: started
+        restart_policy: unless-stopped
+        networks:
+          - name: "{{ control_plane_network_name }}"
+        published_ports:
+          - "{{ control_plane_host_port }}:{{ control_plane_container_port }}"
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+        command:
+          - uvicorn
+          - controller:app
+          - --host
+          - 0.0.0.0
+          - --port
+          - "{{ control_plane_container_port }}"
+        env:
+          DB_URL: "{{ control_plane_db_url }}"
+          DOCKER_INTERFACE_API_KEY: "{{ control_plane_api_key }}"
+          RABBITMQ_URL: "{{ control_plane_rabbitmq_url }}"
+          RABBITMQ_EXCHANGE: "{{ control_plane_rabbitmq_exchange | default('lab.events') }}"
+          RABBITMQ_QUEUE: "{{ control_plane_rabbitmq_queue | default('control_plane.heartbeats') }}"
+          RABBITMQ_ROUTING_KEY_PATTERN: "{{ control_plane_routing_key_pattern | default('heartbeat.*') }}"

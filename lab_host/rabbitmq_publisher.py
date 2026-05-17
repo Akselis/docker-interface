@@ -19,7 +19,7 @@ LAB_HOST_ID = os.getenv("LAB_HOST_ID", socket.gethostname())
 
 
 def _snapshot_running_containers(client: docker.DockerClient) -> list[dict[str, Any]]:
-    containers = client.containers.list(all=False)
+    containers = client.containers.list(all=True)
     payload: list[dict[str, Any]] = []
     for c in containers:
         c.reload()

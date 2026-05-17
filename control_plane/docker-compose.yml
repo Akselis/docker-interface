@@ -73,11 +73,11 @@ services:
       rabbitmq:
         condition: service_started
     ports:
-      - "8000:8000"
+      - "8001:8001"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     command:
-      ["uvicorn", "controller:app", "--host", "0.0.0.0", "--port", "8000"]
+      ["uvicorn", "controller:app", "--host", "0.0.0.0", "--port", "8001"]
 
 volumes:
   db_data:

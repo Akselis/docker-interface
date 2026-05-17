@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import tarfile
@@ -14,7 +16,7 @@ from docker.errors import NotFound
 from docker.models.containers import Container
 from docker.models.networks import Network
 from docker.types import IPAMConfig, IPAMPool
-from mappings import build_container_kwargs
+from mappings import build_container_kwargs, summarize_container, summarize_network
 from models import (
     ComposeActionArgs,
     ComposeDeployArgs,
@@ -29,6 +31,30 @@ from models import (
 
 client = docker.from_env()
 COMPOSE_PROJECTS_DIR = Path(os.getenv("COMPOSE_PROJECTS_DIR", "/tmp/lab_host/compose"))
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+PROJECT_META_FILENAME = ".lab_host_project.json"
+
+_MEMORY_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
+_MEMORY_MULTIPLIERS: dict[str, int] = {
+    "": 1,
+    "b": 1,
+    "k": 1024,
+    "kb": 1024,
+    "ki": 1024,
+    "kib": 1024,
+    "m": 1024**2,
+    "mb": 1024**2,
+    "mi": 1024**2,
+    "mib": 1024**2,
+    "g": 1024**3,
+    "gb": 1024**3,
+    "gi": 1024**3,
+    "gib": 1024**3,
+    "t": 1024**4,
+    "tb": 1024**4,
+    "ti": 1024**4,
+    "tib": 1024**4,
+}
 
 
 def _project_dir(project_name: str) -> Path:
@@ -46,6 +72,177 @@ def _compose_env(extra_env: dict[str, str] | None, project_name: str) -> dict[st
     if extra_env:
         env.update(extra_env)
     return env
+
+
+def _project_metadata_path(project_path: Path) -> Path:
+    return project_path / PROJECT_META_FILENAME
+
+
+def _write_project_metadata(args: ComposeDeployArgs, project_path: Path) -> None:
+    metadata = {
+        "project_name": args.project_name,
+        "compose_file": args.compose_file,
+        "source_type": args.source_type.value,
+        "source_url": args.source_url,
+        "ref": args.ref,
+        "cpu_limit": args.cpu_limit,
+        "memory_limit": args.memory_limit,
+    }
+    _project_metadata_path(project_path).write_text(
+        json.dumps(metadata, indent=2), encoding="utf-8"
+    )
+
+
+def _read_project_metadata(project_path: Path) -> dict[str, object]:
+    metadata_path = _project_metadata_path(project_path)
+    if not metadata_path.exists():
+        return {}
+
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+    return payload if isinstance(payload, dict) else {}
+
+
+def _compose_project_filters(
+    project_name: str,
+) -> dict[str, str | list[str] | bool]:
+    return {"label": f"{COMPOSE_PROJECT_LABEL}={project_name}"}
+
+
+def _parse_memory_limit_to_bytes(memory_limit: str) -> int:
+    match = _MEMORY_PATTERN.match(memory_limit)
+    if not match:
+        raise ValueError(
+            "Invalid memory_limit format. Use values like '512m', '1g', '1024mb'."
+        )
+
+    number_raw, unit_raw = match.groups()
+    amount = float(number_raw)
+    multiplier = _MEMORY_MULTIPLIERS.get(unit_raw.lower())
+    if multiplier is None:
+        raise ValueError(
+            f"Unsupported memory unit '{unit_raw}'. Use b/k/m/g/t or ki/mi/gi/ti variants."
+        )
+
+    bytes_value = int(amount * multiplier)
+    if bytes_value <= 0:
+        raise ValueError("memory_limit must resolve to a positive number of bytes")
+
+    return bytes_value
+
+
+def _apply_compose_project_limits(
+    project_name: str,
+    cpu_limit: float | None,
+    memory_limit: str | None,
+) -> None:
+    if cpu_limit is None and memory_limit is None:
+        return
+
+    containers = client.containers.list(
+        all=True,
+        filters=_compose_project_filters(project_name),
+    )
+    if not containers:
+        return
+
+    container_count = len(containers)
+
+    cpu_quotas: list[int] | None = None
+    if cpu_limit is not None:
+        total_quota = int(cpu_limit * 100000)
+        if total_quota < container_count:
+            raise ValueError(
+                "cpu_limit is too low for the number of project containers"
+            )
+        base_quota = total_quota // container_count
+        quota_remainder = total_quota % container_count
+        cpu_quotas = [
+            base_quota + (1 if idx < quota_remainder else 0)
+            for idx in range(container_count)
+        ]
+
+    memory_limits: list[int] | None = None
+    if memory_limit is not None:
+        total_memory_bytes = _parse_memory_limit_to_bytes(memory_limit)
+        if total_memory_bytes < container_count:
+            raise ValueError(
+                "memory_limit is too low for the number of project containers"
+            )
+        base_memory = total_memory_bytes // container_count
+        memory_remainder = total_memory_bytes % container_count
+        memory_limits = [
+            base_memory + (1 if idx < memory_remainder else 0)
+            for idx in range(container_count)
+        ]
+
+    for idx, container in enumerate(containers):
+        cpu_quota = cpu_quotas[idx] if cpu_quotas is not None else None
+        mem_limit = memory_limits[idx] if memory_limits is not None else None
+
+        if cpu_quota is not None and mem_limit is not None:
+            container.update(cpu_quota=cpu_quota, mem_limit=mem_limit)
+        elif cpu_quota is not None:
+            container.update(cpu_quota=cpu_quota)
+        elif mem_limit is not None:
+            container.update(mem_limit=mem_limit)
+
+
+def _limits_from_metadata(project_name: str) -> tuple[float | None, str | None]:
+    metadata = _read_project_metadata(_project_dir(project_name))
+
+    cpu_limit_obj = metadata.get("cpu_limit")
+    cpu_limit: float | None
+    if isinstance(cpu_limit_obj, (int, float)):
+        cpu_limit = float(cpu_limit_obj)
+    else:
+        cpu_limit = None
+
+    memory_limit_obj = metadata.get("memory_limit")
+    memory_limit = memory_limit_obj if isinstance(memory_limit_obj, str) else None
+
+    return cpu_limit, memory_limit
+
+
+def _project_snapshot(
+    project_name: str,
+    compose_file: str | None = None,
+    extra_info: dict[str, object] | None = None,
+) -> dict[str, object]:
+    project_path = _project_dir(project_name)
+    if not project_path.exists():
+        raise FileNotFoundError(f"Compose project not found: {project_name}")
+
+    metadata = _read_project_metadata(project_path)
+    containers = client.containers.list(
+        all=True,
+        filters=_compose_project_filters(project_name),
+    )
+    networks = client.networks.list(filters=_compose_project_filters(project_name))
+
+    info: dict[str, object] = {
+        "name": project_name,
+        "path": str(project_path),
+        "compose_file": compose_file or metadata.get("compose_file"),
+        "source_type": metadata.get("source_type"),
+        "source_url": metadata.get("source_url"),
+        "ref": metadata.get("ref"),
+        "cpu_limit": metadata.get("cpu_limit"),
+        "memory_limit": metadata.get("memory_limit"),
+        "container_count": len(containers),
+        "network_count": len(networks),
+    }
+    if extra_info:
+        info.update(extra_info)
+
+    return {
+        "info": info,
+        "containers": [summarize_container(c) for c in containers],
+        "networks": [summarize_network(n) for n in networks],
+    }
 
 
 def _run_compose(
@@ -129,6 +326,8 @@ def deploy_compose_package(args: ComposeDeployArgs) -> dict[str, object]:
     if not compose_path.exists():
         raise FileNotFoundError(f"Compose file not found: {args.compose_file}")
 
+    _write_project_metadata(args, project_path)
+
     if args.pull:
         pull_res = _run_compose(args.project_name, ["pull"], env=args.env)
         if pull_res.returncode != 0:
@@ -141,16 +340,17 @@ def deploy_compose_package(args: ComposeDeployArgs) -> dict[str, object]:
     if up_res.returncode != 0:
         raise RuntimeError(f"docker compose up failed: {up_res.stderr}")
 
-    ps_res = _run_compose(args.project_name, ["ps", "--format", "json"], env=args.env)
+    _apply_compose_project_limits(
+        args.project_name,
+        args.cpu_limit,
+        args.memory_limit,
+    )
 
-    return {
-        "project_name": args.project_name,
-        "project_path": str(project_path),
-        "compose_file": args.compose_file,
-        "stdout": up_res.stdout,
-        "stderr": up_res.stderr,
-        "services": ps_res.stdout,
-    }
+    return _project_snapshot(
+        args.project_name,
+        compose_file=args.compose_file,
+        extra_info={"status": "deployed"},
+    )
 
 
 def compose_up(
@@ -166,7 +366,11 @@ def compose_up(
     )
     if res.returncode != 0:
         raise RuntimeError(f"docker compose up failed: {res.stderr}")
-    return {"stdout": res.stdout, "stderr": res.stderr}
+
+    cpu_limit, memory_limit = _limits_from_metadata(project_name)
+    _apply_compose_project_limits(project_name, cpu_limit, memory_limit)
+
+    return _project_snapshot(project_name, extra_info={"status": "running"})
 
 
 def compose_down(
@@ -187,7 +391,7 @@ def compose_down(
     )
     if res.returncode != 0:
         raise RuntimeError(f"docker compose down failed: {res.stderr}")
-    return {"stdout": res.stdout, "stderr": res.stderr}
+    return _project_snapshot(project_name, extra_info={"status": "stopped"})
 
 
 def compose_pull(
@@ -202,7 +406,7 @@ def compose_pull(
     )
     if res.returncode != 0:
         raise RuntimeError(f"docker compose pull failed: {res.stderr}")
-    return {"stdout": res.stdout, "stderr": res.stderr}
+    return _project_snapshot(project_name)
 
 
 def compose_ps(
@@ -217,7 +421,7 @@ def compose_ps(
     )
     if res.returncode != 0:
         raise RuntimeError(f"docker compose ps failed: {res.stderr}")
-    return {"services": res.stdout}
+    return _project_snapshot(project_name)
 
 
 def compose_logs(
@@ -231,13 +435,16 @@ def compose_logs(
     res = _run_compose(project_name, cmd, timeout_seconds=120)
     if res.returncode != 0:
         raise RuntimeError(f"docker compose logs failed: {res.stderr}")
-    return {"logs": res.stdout}
+
+    snapshot = _project_snapshot(project_name)
+    snapshot["logs"] = res.stdout
+    return snapshot
 
 
 def destroy_compose_project(
     project_name: str, remove_volumes: bool = False
 ) -> dict[str, object]:
-    down_res = compose_down(
+    compose_down(
         project_name,
         ComposeActionArgs(remove_volumes=remove_volumes),
     )
@@ -247,9 +454,15 @@ def destroy_compose_project(
         shutil.rmtree(project_path)
 
     return {
-        "project_name": project_name,
-        "status": "removed",
-        "down": down_res,
+        "info": {
+            "name": project_name,
+            "path": str(project_path),
+            "status": "removed",
+            "container_count": 0,
+            "network_count": 0,
+        },
+        "containers": [],
+        "networks": [],
     }
 
 

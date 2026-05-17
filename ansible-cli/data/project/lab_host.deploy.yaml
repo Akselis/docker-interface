@@ -1,0 +1,54 @@
+---
+- hosts: "{{ target_host }}"
+  become: true
+
+  vars:
+    lab_host_image: "{{ lab_host_image | default('lab-host:latest') }}"
+    lab_host_container_name: "{{ lab_host_container_name | default('lab-host-api') }}"
+    lab_host_host_port: "{{ lab_host_host_port | default(8000) }}"
+    lab_host_container_port: "{{ lab_host_container_port | default(8000) }}"
+    lab_host_compose_dir: "{{ lab_host_compose_dir | default('/opt/lab_host/compose') }}"
+    lab_host_restart_policy: "{{ lab_host_restart_policy | default('unless-stopped') }}"
+    lab_host_network_name: "{{ lab_host_network_name | default('bridge') }}"
+
+  pre_tasks:
+    - name: Ensure lab host API key is provided
+      ansible.builtin.assert:
+        that:
+          - lab_host_api_key is defined
+          - lab_host_api_key | string | length > 0
+        fail_msg: "Set lab_host_api_key when running this playbook."
+
+  tasks:
+    - name: Ensure compose projects directory exists
+      ansible.builtin.file:
+        path: "{{ lab_host_compose_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Run lab host container
+      community.docker.docker_container:
+        name: "{{ lab_host_container_name }}"
+        image: "{{ lab_host_image }}"
+        state: started
+        restart_policy: "{{ lab_host_restart_policy }}"
+        network_mode: "{{ lab_host_network_name }}"
+        published_ports:
+          - "{{ lab_host_host_port }}:{{ lab_host_container_port }}"
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - "{{ lab_host_compose_dir }}:{{ lab_host_compose_dir }}"
+        command:
+          - uvicorn
+          - controller:app
+          - --host
+          - 0.0.0.0
+          - --port
+          - "{{ lab_host_container_port }}"
+        env:
+          DOCKER_INTERFACE_API_KEY: "{{ lab_host_api_key }}"
+          COMPOSE_PROJECTS_DIR: "{{ lab_host_compose_dir }}"
+          LAB_HOST_ID: "{{ lab_host_id | default(inventory_hostname) }}"
+          RABBITMQ_URL: "{{ lab_host_rabbitmq_url | default('amqp://guest:guest@localhost:5672/%2F') }}"
+          RABBITMQ_EXCHANGE: "{{ lab_host_rabbitmq_exchange | default('lab.events') }}"
+          HEARTBEAT_INTERVAL_SECONDS: "{{ lab_host_heartbeat_interval | default(10) }}"
