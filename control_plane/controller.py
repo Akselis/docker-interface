@@ -23,10 +23,12 @@ from controller_helpers import (
 from db.models.container import Container
 from db.models.host import Host
 from db.models.lab import Lab, LabStatus
-from db.models.project import Project
+from db.models.network import Network, NetworkDriver
+from db.models.project import Project, ProjectNetworkMode
 from db.repos.container import ContainerRepository
 from db.repos.host import HostRepository
 from db.repos.lab import LabRepository
+from db.repos.network import NetworkRepository
 from db.repos.project import ProjectRepository
 from db.session import get_session
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -36,14 +38,163 @@ from models import (
     ComposeDeployRequest,
     CreateLabRequest,
     DeployEnvironmentRequest,
+    EnvironmentNetworkMode,
     NameListRequest,
     RegisterHostRequest,
 )
+from networking.providers import get_dns_provider, get_ingress_provider
 from rabbitmq_consumer import start_consumer_thread
 from secret_store import build_host_api_key_secret_path, get_secret_store
 from sqlalchemy.ext.asyncio import AsyncSession
 
 app = FastAPI()
+
+
+def _safe_slug(value: str) -> str:
+    slug = "".join(ch for ch in value.lower() if ch.isalnum() or ch in "-_")
+    return slug.strip("-_") or "lab"
+
+
+def _extract_network_from_result(
+    result: dict[str, object],
+) -> tuple[str, str, NetworkDriver]:
+    body = extract_body(result)
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Invalid network response from lab host",
+        )
+
+    network_obj = body.get("network")
+    if not isinstance(network_obj, dict):
+        raise HTTPException(
+            status_code=502,
+            detail="Lab host network response is missing 'network' payload",
+        )
+
+    network_id_obj = network_obj.get("id")
+    network_name_obj = network_obj.get("name")
+    driver_obj = network_obj.get("driver")
+
+    if not isinstance(network_id_obj, str) or not isinstance(network_name_obj, str):
+        raise HTTPException(
+            status_code=502,
+            detail="Lab host network payload is malformed",
+        )
+
+    driver_value = str(driver_obj or "bridge").lower()
+    driver = NetworkDriver.BRIDGE
+    if driver_value == "overlay":
+        driver = NetworkDriver.OVERLAY
+
+    return network_id_obj, network_name_obj, driver
+
+
+def _route_hostname(*, resource_name: str, lab_name: str, base_domain: str) -> str:
+    return (
+        f"{_safe_slug(resource_name)}-{_safe_slug(lab_name)}.{base_domain.strip('.')}"
+    )
+
+
+def _resolve_upstream_port_from_ports(payload_ports: object) -> int | None:
+    if not isinstance(payload_ports, list):
+        return None
+
+    for port in payload_ports:
+        if not isinstance(port, dict):
+            continue
+        host_port = port.get("host")
+        protocol = str(port.get("protocol") or "").lower()
+        if (
+            isinstance(host_port, int)
+            and 1 <= host_port <= 65535
+            and protocol
+            in {
+                "tcp",
+                "",
+            }
+        ):
+            return host_port
+    return None
+
+
+async def _ensure_dns_wildcard_for_host(host: Host) -> None:
+    if not host.base_domain or not host.ingress_target:
+        return
+
+    wildcard_fqdn = f"*.{host.base_domain.strip('.')}"
+    zone = host.dns_zone or host.base_domain
+    dns = get_dns_provider()
+    await dns.ensure_wildcard(
+        zone=zone,
+        wildcard_fqdn=wildcard_fqdn,
+        target=host.ingress_target,
+    )
+
+
+async def _ensure_ingress_route_for_runtime_container(
+    *,
+    host: Host,
+    lab: Lab,
+    resource_name: str,
+    runtime: dict[str, object],
+) -> str | None:
+    if not host.base_domain:
+        return None
+
+    ports_obj = runtime.get("ports")
+    upstream_port = _resolve_upstream_port_from_ports(ports_obj)
+    if upstream_port is None:
+        return None
+
+    fqdn = _route_hostname(
+        resource_name=resource_name,
+        lab_name=lab.name,
+        base_domain=host.base_domain,
+    )
+
+    ingress = get_ingress_provider()
+    await ingress.ensure_route(
+        hostname=fqdn,
+        upstream_host=host.ip_address,
+        upstream_port=upstream_port,
+        metadata={
+            "lab_name": lab.name,
+            "host_id": str(host.id),
+            "resource_name": resource_name,
+        },
+    )
+
+    return fqdn
+
+
+def _compose_service_name(container: dict[str, object]) -> str | None:
+    labels_obj = container.get("labels")
+    if not isinstance(labels_obj, dict):
+        return None
+
+    service_name = labels_obj.get("com.docker.compose.service")
+    if isinstance(service_name, str) and service_name:
+        return service_name
+    return None
+
+
+async def _delete_ingress_route_if_possible(
+    *,
+    host: Host,
+    lab_name: str,
+    resource_name: str,
+) -> None:
+    if not host.base_domain:
+        return
+
+    fqdn = _route_hostname(
+        resource_name=resource_name,
+        lab_name=lab_name,
+        base_domain=host.base_domain,
+    )
+    ingress = get_ingress_provider()
+    await ingress.delete_route(hostname=fqdn)
 
 
 @app.on_event("startup")
@@ -119,11 +270,15 @@ async def register_host(
                 scheme=payload.scheme,
                 api_key_secret_path=secret_path,
                 status=payload.status,
+                base_domain=payload.base_domain,
+                dns_zone=payload.dns_zone,
+                ingress_target=payload.ingress_target,
                 cpu_total=payload.cpu_total,
                 memory_total_mb=payload.memory_total_mb,
                 last_heartbeat_utc=now,
             )
         )
+        await _ensure_dns_wildcard_for_host(host)
         return {"status": "registered", "host": serialize_host(host)}
 
     existing.hostname = payload.hostname
@@ -132,10 +287,14 @@ async def register_host(
     existing.scheme = payload.scheme
     existing.api_key_secret_path = secret_path
     existing.status = payload.status
+    existing.base_domain = payload.base_domain
+    existing.dns_zone = payload.dns_zone
+    existing.ingress_target = payload.ingress_target
     existing.cpu_total = payload.cpu_total
     existing.memory_total_mb = payload.memory_total_mb
     existing.last_heartbeat_utc = now
     host = await host_repo.update(existing)
+    await _ensure_dns_wildcard_for_host(host)
     return {"status": "updated", "host": serialize_host(host)}
 
 
@@ -202,6 +361,7 @@ async def create_lab(
 ):
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
+    network_repo = NetworkRepository(session)
 
     existing_lab = await lab_repo.get_by_name(payload.name)
     if existing_lab is not None:
@@ -250,6 +410,103 @@ async def create_lab(
             memory_limit_mb=payload.memory_limit_mb,
         )
     )
+
+    default_internal_network_name = (
+        f"lab-{_safe_slug(payload.name)}-{created.id}-internal"
+    )
+    default_external_network_name = (
+        f"lab-{_safe_slug(payload.name)}-{created.id}-external"
+    )
+
+    created_network_ids: list[str] = []
+
+    try:
+        internal_result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="POST",
+            endpoint_path="/networks",
+            json_body={
+                "name": default_internal_network_name,
+                "driver": "bridge",
+                "internal": True,
+                "labels": {
+                    "evlab.managed_by": "control-plane",
+                    "evlab.lab.id": str(created.id),
+                    "evlab.lab.name": payload.name,
+                    "evlab.network.role": "default-internal",
+                },
+            },
+        )
+        raise_for_lab_host_error(
+            internal_result,
+            operation=f"create default internal network for lab '{payload.name}'",
+        )
+        internal_network_id, internal_name, internal_driver = (
+            _extract_network_from_result(internal_result)
+        )
+        created_network_ids.append(internal_network_id)
+        internal_network_row = await network_repo.insert(
+            Network(
+                network_id=internal_network_id,
+                name=internal_name,
+                lab_id=created.id,
+                driver=internal_driver,
+            )
+        )
+
+        external_result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="POST",
+            endpoint_path="/networks",
+            json_body={
+                "name": default_external_network_name,
+                "driver": "bridge",
+                "internal": False,
+                "labels": {
+                    "evlab.managed_by": "control-plane",
+                    "evlab.lab.id": str(created.id),
+                    "evlab.lab.name": payload.name,
+                    "evlab.network.role": "default-external",
+                },
+            },
+        )
+        raise_for_lab_host_error(
+            external_result,
+            operation=f"create default external network for lab '{payload.name}'",
+        )
+        external_network_id, external_name, external_driver = (
+            _extract_network_from_result(external_result)
+        )
+        created_network_ids.append(external_network_id)
+        external_network_row = await network_repo.insert(
+            Network(
+                network_id=external_network_id,
+                name=external_name,
+                lab_id=created.id,
+                driver=external_driver,
+            )
+        )
+
+        created.default_internal_network_id = internal_network_row.id
+        created.default_external_network_id = external_network_row.id
+        created = await lab_repo.update(created)
+    except Exception:
+        for network_id in created_network_ids:
+            try:
+                await call_lab_host(
+                    host=host,
+                    api_key=api_key,
+                    method="DELETE",
+                    endpoint_path=f"/networks/{network_id}",
+                )
+            except Exception:
+                pass
+
+        await lab_repo.delete_by_lab_id(created.id)
+        raise
+
     return {"lab": serialize_lab(created)}
 
 
@@ -262,6 +519,7 @@ async def delete_lab(
     host_repo = HostRepository(session)
     project_repo = ProjectRepository(session)
     container_repo = ContainerRepository(session)
+    network_repo = NetworkRepository(session)
 
     lab = await lab_repo.get_by_name(lab_name)
     if lab is None:
@@ -292,6 +550,14 @@ async def delete_lab(
             )
         else:
             removed_projects.append(row.project_name)
+            if isinstance(row.exposed_services, list):
+                for service_name in row.exposed_services:
+                    if isinstance(service_name, str) and service_name:
+                        await _delete_ingress_route_if_possible(
+                            host=host,
+                            lab_name=lab.name,
+                            resource_name=service_name,
+                        )
 
     removed_containers: list[str] = []
     failed_containers: list[dict[str, object]] = []
@@ -315,6 +581,35 @@ async def delete_lab(
             )
         else:
             removed_containers.append(row.name)
+            await _delete_ingress_route_if_possible(
+                host=host,
+                lab_name=lab.name,
+                resource_name=row.name,
+            )
+
+    removed_networks: list[str] = []
+    failed_networks: list[dict[str, object]] = []
+
+    network_rows = await network_repo.list_by_lab_id(lab.id)
+    for row in network_rows:
+        result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="DELETE",
+            endpoint_path=f"/networks/{row.network_id}",
+        )
+        code = extract_status_code(result)
+        if code >= 400 and code != 404:
+            failed_networks.append(
+                {
+                    "network_name": row.name,
+                    "network_id": row.network_id,
+                    "status_code": code,
+                    "body": extract_body(result),
+                }
+            )
+        else:
+            removed_networks.append(row.name)
 
     volumes_prune = await call_lab_host(
         host=host,
@@ -322,15 +617,10 @@ async def delete_lab(
         method="POST",
         endpoint_path="/volumes/prune",
     )
-    networks_prune = await call_lab_host(
-        host=host,
-        api_key=api_key,
-        method="POST",
-        endpoint_path="/networks/prune",
-    )
 
     await project_repo.delete_by_lab_id(lab.id)
     await container_repo.delete_by_lab_id(lab.id)
+    await network_repo.delete_by_lab_id(lab.id)
     await lab_repo.delete_by_lab_id(lab.id)
 
     return {
@@ -340,8 +630,9 @@ async def delete_lab(
         "failed_projects": failed_projects,
         "removed_containers": removed_containers,
         "failed_containers": failed_containers,
+        "removed_networks": removed_networks,
+        "failed_networks": failed_networks,
         "volumes_prune": volumes_prune,
-        "networks_prune": networks_prune,
     }
 
 
@@ -523,6 +814,7 @@ async def deploy_lab_environment(
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
     container_repo = ContainerRepository(session)
+    network_repo = NetworkRepository(session)
 
     lab = await lab_repo.get_by_name(lab_name)
     if lab is None:
@@ -568,17 +860,111 @@ async def deploy_lab_environment(
     )
 
     lab_host_payload = payload.model_dump(
-        exclude={"lifetime_type", "time_to_live_seconds"}
+        exclude={"lifetime_type", "time_to_live_seconds", "network_mode"}
     )
 
-    result = await call_lab_host(
-        host=host,
-        api_key=api_key,
-        method="POST",
-        endpoint_path="/containers",
-        json_body=lab_host_payload,
-    )
-    raise_for_lab_host_error(result, operation="create container")
+    created_private_network: Network | None = None
+
+    if payload.network_mode == EnvironmentNetworkMode.OFFLINE:
+        lab_host_payload["network"] = [{"name": "none"}]
+    elif payload.network_mode == EnvironmentNetworkMode.INTERNAL_EXPOSED:
+        if lab.default_internal_network_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lab '{lab.name}' has no default internal network configured",
+            )
+
+        default_network = await network_repo.get_by_id(lab.default_internal_network_id)
+        if default_network is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Default internal network entry not found for lab '{lab.name}'",
+            )
+
+        lab_host_payload["network"] = [{"name": default_network.name}]
+    elif payload.network_mode == EnvironmentNetworkMode.EXTERNAL_EXPOSED:
+        if lab.default_external_network_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lab '{lab.name}' has no default external network configured",
+            )
+
+        default_network = await network_repo.get_by_id(lab.default_external_network_id)
+        if default_network is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Default external network entry not found for lab '{lab.name}'",
+            )
+
+        lab_host_payload["network"] = [{"name": default_network.name}]
+    else:
+        is_external_private = (
+            payload.network_mode == EnvironmentNetworkMode.EXTERNAL_PRIVATE
+        )
+        private_network_name = (
+            f"lab-{_safe_slug(lab.name)}-{lab.id}-env-{_safe_slug(payload.name)}"
+        )
+        private_result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="POST",
+            endpoint_path="/networks",
+            json_body={
+                "name": private_network_name,
+                "driver": "bridge",
+                "internal": not is_external_private,
+                "labels": {
+                    "evlab.managed_by": "control-plane",
+                    "evlab.lab.id": str(lab.id),
+                    "evlab.lab.name": lab.name,
+                    "evlab.network.role": "environment-private",
+                    "evlab.environment.name": payload.name,
+                    "evlab.environment.exposure": "external"
+                    if is_external_private
+                    else "internal",
+                },
+            },
+        )
+        raise_for_lab_host_error(
+            private_result,
+            operation=f"create private network for environment '{payload.name}'",
+        )
+
+        network_id, resolved_name, network_driver = _extract_network_from_result(
+            private_result
+        )
+        created_private_network = await network_repo.insert(
+            Network(
+                network_id=network_id,
+                name=resolved_name,
+                lab_id=lab.id,
+                driver=network_driver,
+            )
+        )
+        lab_host_payload["network"] = [{"name": resolved_name}]
+
+    try:
+        result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="POST",
+            endpoint_path="/containers",
+            json_body=lab_host_payload,
+        )
+        raise_for_lab_host_error(result, operation="create container")
+    except Exception:
+        if created_private_network is not None:
+            try:
+                await call_lab_host(
+                    host=host,
+                    api_key=api_key,
+                    method="DELETE",
+                    endpoint_path=f"/networks/{created_private_network.network_id}",
+                )
+            except Exception:
+                pass
+            await network_repo.delete_row(created_private_network)
+        raise
 
     body = extract_body(result)
     runtime = extract_container_from_body(body)
@@ -646,11 +1032,40 @@ async def deploy_lab_environment(
         existing.last_seen_utc = now
         await container_repo.update(existing)
 
+    ingress_hostname: str | None = None
+    if payload.network_mode in {
+        EnvironmentNetworkMode.EXTERNAL_PRIVATE,
+        EnvironmentNetworkMode.EXTERNAL_EXPOSED,
+    }:
+        full_runtime_result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="GET",
+            endpoint_path=f"/containers/{container_id_obj}",
+            query={"full": "true"},
+        )
+        raise_for_lab_host_error(
+            full_runtime_result,
+            operation=f"get runtime container '{container_id_obj}'",
+        )
+        full_runtime_body = extract_body(full_runtime_result)
+        full_runtime = extract_container_from_body(full_runtime_body)
+        if isinstance(full_runtime, dict):
+            ingress_hostname = await _ensure_ingress_route_for_runtime_container(
+                host=host,
+                lab=lab,
+                resource_name=container_name_obj,
+                runtime=full_runtime,
+            )
+
     if lab.status != LabStatus.RUNNING:
         lab.status = LabStatus.RUNNING
         await lab_repo.update(lab)
 
-    return {"lab": serialize_lab(lab), "environment": runtime}
+    response: dict[str, object] = {"lab": serialize_lab(lab), "environment": runtime}
+    if ingress_hostname is not None:
+        response["ingress_hostname"] = ingress_hostname
+    return response
 
 
 @app.post("/lab/{lab_name}/projects", status_code=status.HTTP_201_CREATED)
@@ -683,6 +1098,12 @@ async def deploy_lab_project(
         if row is not None and row.memory_limit_mb is not None
         else None
     )
+
+    if payload.network_mode == EnvironmentNetworkMode.OFFLINE:
+        raise HTTPException(
+            status_code=400,
+            detail="Project network_mode 'offline' is not supported",
+        )
 
     host, api_key = await resolve_lab_host_connection(host_repo, lab)
     await enforce_resource_capacity(
@@ -717,6 +1138,132 @@ async def deploy_lab_project(
             detail="Invalid response from lab host compose deploy endpoint",
         )
 
+    project_payload = body["project"]
+    containers_obj = project_payload.get("containers")
+    project_containers = containers_obj if isinstance(containers_obj, list) else []
+
+    network_mode = ProjectNetworkMode(payload.network_mode.value)
+    if network_mode == ProjectNetworkMode.INTERNAL_EXPOSED:
+        if lab.default_internal_network_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lab '{lab.name}' has no default internal network configured",
+            )
+        default_internal_network = await NetworkRepository(session).get_by_id(
+            lab.default_internal_network_id
+        )
+        if default_internal_network is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Default internal network entry not found for lab '{lab.name}'",
+            )
+
+        for container in project_containers:
+            if not isinstance(container, dict):
+                continue
+            container_id = container.get("id")
+            if not isinstance(container_id, str) or not container_id:
+                continue
+            connect_result = await call_lab_host(
+                host=host,
+                api_key=api_key,
+                method="POST",
+                endpoint_path=f"/networks/{default_internal_network.network_id}/connect",
+                json_body={"container_id": container_id},
+            )
+            raise_for_lab_host_error(
+                connect_result,
+                operation=(
+                    f"connect compose container '{container_id}' to internal lab network"
+                ),
+            )
+
+    if network_mode == ProjectNetworkMode.EXTERNAL_EXPOSED:
+        if lab.default_external_network_id is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Lab '{lab.name}' has no default external network configured",
+            )
+        default_external_network = await NetworkRepository(session).get_by_id(
+            lab.default_external_network_id
+        )
+        if default_external_network is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Default external network entry not found for lab '{lab.name}'",
+            )
+
+        for container in project_containers:
+            if not isinstance(container, dict):
+                continue
+            container_id = container.get("id")
+            if not isinstance(container_id, str) or not container_id:
+                continue
+            connect_result = await call_lab_host(
+                host=host,
+                api_key=api_key,
+                method="POST",
+                endpoint_path=f"/networks/{default_external_network.network_id}/connect",
+                json_body={"container_id": container_id},
+            )
+            raise_for_lab_host_error(
+                connect_result,
+                operation=(
+                    f"connect compose container '{container_id}' to external lab network"
+                ),
+            )
+
+    exposed_services = [
+        item.strip()
+        for item in (payload.exposed_services or [])
+        if isinstance(item, str) and item.strip()
+    ]
+
+    ingress_routes: dict[str, str] = {}
+    if network_mode in {
+        ProjectNetworkMode.EXTERNAL_PRIVATE,
+        ProjectNetworkMode.EXTERNAL_EXPOSED,
+    }:
+        routed_services: set[str] = set()
+        for container in project_containers:
+            if not isinstance(container, dict):
+                continue
+            service_name = _compose_service_name(container)
+            if not isinstance(service_name, str) or service_name in routed_services:
+                continue
+            if service_name not in exposed_services:
+                continue
+
+            container_id = container.get("id")
+            if not isinstance(container_id, str) or not container_id:
+                continue
+
+            full_runtime_result = await call_lab_host(
+                host=host,
+                api_key=api_key,
+                method="GET",
+                endpoint_path=f"/containers/{container_id}",
+                query={"full": "true"},
+            )
+            raise_for_lab_host_error(
+                full_runtime_result,
+                operation=f"get runtime container '{container_id}'",
+            )
+            full_runtime_body = extract_body(full_runtime_result)
+            full_runtime = extract_container_from_body(full_runtime_body)
+            if not isinstance(full_runtime, dict):
+                continue
+
+            hostname = await _ensure_ingress_route_for_runtime_container(
+                host=host,
+                lab=lab,
+                resource_name=service_name,
+                runtime=full_runtime,
+            )
+            if hostname is not None:
+                ingress_routes[service_name] = hostname
+            routed_services.add(service_name)
+
     if row is None:
         await project_repo.insert(
             Project(
@@ -730,6 +1277,8 @@ async def deploy_lab_project(
                 env=payload.env,
                 pull=payload.pull,
                 build=payload.build,
+                network_mode=network_mode,
+                exposed_services=exposed_services or None,
                 cpu_limit=requested_cpu,
                 memory_limit_mb=requested_memory_mb,
             )
@@ -743,6 +1292,8 @@ async def deploy_lab_project(
         row.env = payload.env
         row.pull = payload.pull
         row.build = payload.build
+        row.network_mode = network_mode
+        row.exposed_services = exposed_services or None
         row.cpu_limit = requested_cpu
         row.memory_limit_mb = requested_memory_mb
         await project_repo.update(row)
@@ -751,7 +1302,13 @@ async def deploy_lab_project(
         lab.status = LabStatus.RUNNING
         await lab_repo.update(lab)
 
-    return {"lab": serialize_lab(lab), "project": body["project"]}
+    response: dict[str, object] = {
+        "lab": serialize_lab(lab),
+        "project": body["project"],
+    }
+    if ingress_routes:
+        response["ingress_routes"] = ingress_routes
+    return response
 
 
 @app.delete("/lab/{lab_name}/environments")
@@ -762,6 +1319,7 @@ async def delete_lab_environments(
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
     container_repo = ContainerRepository(session)
+    network_repo = NetworkRepository(session)
 
     lab = await lab_repo.get_by_name(lab_name)
     if lab is None:
@@ -802,6 +1360,26 @@ async def delete_lab_environments(
 
         removed.append(row.name)
         await container_repo.delete_row(row)
+        await _delete_ingress_route_if_possible(
+            host=host,
+            lab_name=lab.name,
+            resource_name=row.name,
+        )
+
+        private_network_name = (
+            f"lab-{_safe_slug(lab.name)}-{lab.id}-env-{_safe_slug(row.name)}"
+        )
+        private_network = await network_repo.get_by_name(lab.id, private_network_name)
+        if private_network is not None:
+            network_result = await call_lab_host(
+                host=host,
+                api_key=api_key,
+                method="DELETE",
+                endpoint_path=f"/networks/{private_network.network_id}",
+            )
+            network_code = extract_status_code(network_result)
+            if network_code < 400 or network_code == 404:
+                await network_repo.delete_row(private_network)
 
     return {
         "lab": serialize_lab(lab),
@@ -819,6 +1397,7 @@ async def delete_lab_environment(
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
     container_repo = ContainerRepository(session)
+    network_repo = NetworkRepository(session)
 
     lab = await lab_repo.get_by_name(lab_name)
     if lab is None:
@@ -856,6 +1435,26 @@ async def delete_lab_environment(
         )
 
     await container_repo.delete_row(row)
+    await _delete_ingress_route_if_possible(
+        host=host,
+        lab_name=lab.name,
+        resource_name=container_name,
+    )
+
+    private_network_name = (
+        f"lab-{_safe_slug(lab.name)}-{lab.id}-env-{_safe_slug(container_name)}"
+    )
+    private_network = await network_repo.get_by_name(lab.id, private_network_name)
+    if private_network is not None:
+        network_result = await call_lab_host(
+            host=host,
+            api_key=api_key,
+            method="DELETE",
+            endpoint_path=f"/networks/{private_network.network_id}",
+        )
+        network_code = extract_status_code(network_result)
+        if network_code < 400 or network_code == 404:
+            await network_repo.delete_row(private_network)
 
     return {
         "lab": serialize_lab(lab),
@@ -905,6 +1504,15 @@ async def delete_lab_projects(
         removed.append(row.project_name)
         await project_repo.delete_row(row)
 
+        if isinstance(row.exposed_services, list):
+            for service_name in row.exposed_services:
+                if isinstance(service_name, str) and service_name:
+                    await _delete_ingress_route_if_possible(
+                        host=host,
+                        lab_name=lab.name,
+                        resource_name=service_name,
+                    )
+
     return {
         "lab": serialize_lab(lab),
         "removed": removed,
@@ -949,6 +1557,15 @@ async def delete_lab_project(
         )
 
     await project_repo.delete_row(row)
+
+    if isinstance(row.exposed_services, list):
+        for service_name in row.exposed_services:
+            if isinstance(service_name, str) and service_name:
+                await _delete_ingress_route_if_possible(
+                    host=host,
+                    lab_name=lab.name,
+                    resource_name=service_name,
+                )
 
     return {
         "lab": serialize_lab(lab),

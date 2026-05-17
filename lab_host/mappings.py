@@ -9,6 +9,8 @@ from models import ContainerArgs, ContainerStorageMount, PortMapping
 class ContainerRunKwargs(TypedDict):
     image: str
     name: str
+    network: NotRequired[str]
+    network_mode: NotRequired[str]
     command: NotRequired[str | None]
     environment: NotRequired[dict[str, str]]
     ports: NotRequired[dict[str, int]]
@@ -324,6 +326,13 @@ def build_container_kwargs(args: ContainerArgs) -> ContainerRunKwargs:
         "image": args.image,
         "name": args.name,
     }
+
+    if args.network:
+        first_network_name = args.network[0].name
+        if first_network_name == "none":
+            kwargs["network_mode"] = "none"
+        else:
+            kwargs["network"] = first_network_name
 
     if args.command is not None:
         kwargs["command"] = args.command

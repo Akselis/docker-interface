@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 from typing import Any
-from urllib import error, request
+from urllib import error, parse, request
 
 import click
 import core.ansible.inventory as inv
@@ -125,8 +125,110 @@ def _slugify_for_filename(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", value)
 
 
-def _register_lab_host(
-    control_plane: dict[str, Any], payload: dict[str, Any]
+def _collect_context_hosts(state: InfraState) -> set[str]:
+    hosts: set[str] = set()
+
+    cp = state.data.get("control_plane")
+    if isinstance(cp, dict):
+        target_host = cp.get("target_host")
+        if isinstance(target_host, str) and target_host:
+            hosts.add(target_host)
+
+    lab_hosts = state.data.get("lab_hosts")
+    if isinstance(lab_hosts, dict):
+        for value in lab_hosts.values():
+            if not isinstance(value, dict):
+                continue
+            target_host = value.get("target_host")
+            if isinstance(target_host, str) and target_host:
+                hosts.add(target_host)
+
+    return hosts
+
+
+def _remove_hosts_from_inventory(hosts_to_remove: set[str]) -> None:
+    if not hosts_to_remove:
+        return
+
+    i = inv.EvLabInventory()
+    data = i.yaml.data if isinstance(i.yaml.data, dict) else {}
+
+    for group_data in data.values():
+        if not isinstance(group_data, dict):
+            continue
+        group_hosts = group_data.get("hosts")
+        if not isinstance(group_hosts, dict):
+            continue
+
+        for host_name in list(group_hosts.keys()):
+            if host_name in hosts_to_remove:
+                del group_hosts[host_name]
+
+    i.yaml.dump()
+
+
+def _remove_hosts_from_state(state: InfraState, hosts_to_remove: set[str]) -> None:
+    if not hosts_to_remove:
+        return
+
+    cp = state.data.get("control_plane")
+    if isinstance(cp, dict):
+        cp_target = cp.get("target_host")
+        if isinstance(cp_target, str) and cp_target in hosts_to_remove:
+            state.data["control_plane"] = {}
+
+    lab_hosts = state.data.get("lab_hosts")
+    if isinstance(lab_hosts, dict):
+        for host_key, host_value in list(lab_hosts.items()):
+            if not isinstance(host_value, dict):
+                continue
+            target_host = host_value.get("target_host")
+            if isinstance(target_host, str) and target_host in hosts_to_remove:
+                del lab_hosts[host_key]
+
+    lan = state.data.get("lan")
+    if isinstance(lan, dict):
+        devices = lan.get("devices")
+        if isinstance(devices, list):
+            lan["devices"] = [
+                item
+                for item in devices
+                if isinstance(item, str) and item not in hosts_to_remove
+            ]
+
+    state.save()
+
+
+def _resolve_destroy_hosts(state: InfraState, device: str | None) -> set[str]:
+    context_hosts = _collect_context_hosts(state)
+    if not device:
+        return context_hosts
+
+    i = inv.EvLabInventory()
+    try:
+        host_name, _ = _resolve_device(i, device)
+        return {host_name}
+    except click.ClickException:
+        if device in context_hosts:
+            return {device}
+        raise click.ClickException(f"Device not found in CLI context: {device}")
+
+
+def _control_plane_state_or_fail(state: InfraState) -> dict[str, Any]:
+    cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
+    if not isinstance(cp_state, dict) or not cp_state:
+        raise click.ClickException(
+            "Control plane state is missing. Bootstrap control-plane first."
+        )
+    return cp_state
+
+
+def _call_control_plane_api(
+    control_plane: dict[str, Any],
+    method: str,
+    endpoint_path: str,
+    payload: dict[str, Any] | None = None,
+    query: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     control_plane_host = control_plane.get("host") or control_plane.get("ansible_host")
     control_plane_port = int(control_plane.get("port", 8001))
@@ -138,8 +240,12 @@ def _register_lab_host(
     if not isinstance(control_plane_api_key, str) or not control_plane_api_key:
         raise click.ClickException("Control plane API key is not configured in state")
 
-    url = f"{control_plane_scheme}://{control_plane_host}:{control_plane_port}/hosts/register"
-    body = json.dumps(payload).encode("utf-8")
+    path = endpoint_path if endpoint_path.startswith("/") else f"/{endpoint_path}"
+    url = f"{control_plane_scheme}://{control_plane_host}:{control_plane_port}{path}"
+    if query:
+        url = f"{url}?{parse.urlencode(query)}"
+
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
     req = request.Request(
         url=url,
         data=body,
@@ -147,22 +253,56 @@ def _register_lab_host(
             "Content-Type": "application/json",
             "X-API-Key": control_plane_api_key,
         },
-        method="POST",
+        method=method,
     )
 
     try:
-        with request.urlopen(req, timeout=20) as resp:
+        with request.urlopen(req, timeout=30) as resp:
             content = resp.read().decode("utf-8")
             return json.loads(content) if content else {}
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise click.ClickException(
-            f"Failed to register lab host. HTTP {exc.code}: {detail}"
+            f"Control plane request failed. {method} {path} HTTP {exc.code}: {detail}"
         ) from exc
     except error.URLError as exc:
-        raise click.ClickException(
-            f"Failed to reach control plane register endpoint: {exc}"
-        ) from exc
+        raise click.ClickException(f"Failed to reach control plane: {exc}") from exc
+
+
+def _register_lab_host(
+    control_plane: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    return _call_control_plane_api(
+        control_plane=control_plane,
+        method="POST",
+        endpoint_path="/hosts/register",
+        payload=payload,
+    )
+
+
+def _load_json_from_args(
+    json_str: str | None, json_file: str | None
+) -> dict[str, Any] | None:
+    if json_str and json_file:
+        raise click.ClickException("Use either --json or --json-file, not both")
+
+    payload_text: str | None = json_str
+    if json_file:
+        with open(json_file, "r", encoding="utf-8") as f:
+            payload_text = f.read()
+
+    if payload_text is None:
+        return None
+
+    try:
+        parsed = json.loads(payload_text)
+    except json.JSONDecodeError as exc:
+        raise click.ClickException(f"Invalid JSON payload: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise click.ClickException("JSON payload must be an object")
+
+    return parsed
 
 
 @click.group()
@@ -342,11 +482,29 @@ def infra_status() -> None:
 
 
 @infra.command("destroy")
+@click.option("--device", default=None, help="Device name in inventory or raw IP")
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Skip teardown and only remove device(s) from CLI context",
+)
+@click.option("--keep-volumes/--remove-volumes", default=True, show_default=True)
+@click.option(
+    "--become-password",
+    default=None,
+    hide_input=True,
+    help="Sudo password for privilege escalation on the target host",
+)
 @click.option("--terraform-workdir", default=None)
 @click.option("--terraform-workspace", default=None)
 @click.option("--terraform-var-file", default=None)
 @click.option("--auto-approve/--no-auto-approve", default=True, show_default=True)
 def infra_destroy(
+    device: str | None,
+    force: bool,
+    keep_volumes: bool,
+    become_password: str | None,
     terraform_workdir: str | None,
     terraform_workspace: str | None,
     terraform_var_file: str | None,
@@ -363,12 +521,45 @@ def infra_destroy(
         else str(tf_state.get("var_file") or "")
     )
 
-    provision_type = state.data.get("provision", {}).get("type")
-    if provision_type == "local":
-        click.secho("Local mode destroy: nothing to terraform-destroy.", fg="yellow")
+    target_hosts = _resolve_destroy_hosts(state, device)
+
+    if force:
+        _remove_hosts_from_inventory(target_hosts)
+        _remove_hosts_from_state(state, target_hosts)
+        if target_hosts:
+            click.secho(
+                f"Force destroy: removed {', '.join(sorted(target_hosts))} from CLI context.",
+                fg="yellow",
+            )
+        else:
+            click.secho("Force destroy: no devices found in CLI context.", fg="yellow")
         return
-    if provision_type == "lan":
-        click.secho("LAN mode destroy: no terraform resources to destroy.", fg="yellow")
+
+    if target_hosts:
+        teardown_extravars: dict[str, Any] = {
+            "keep_volumes": keep_volumes,
+            "ansible_become_password": _resolve_become_password(become_password),
+        }
+
+        for target_host in sorted(target_hosts):
+            ok, msg = run_playbook(
+                "host.teardown.containers.yaml",
+                {**teardown_extravars, "target_host": target_host},
+            )
+            if not ok:
+                raise click.ClickException(
+                    f"Container teardown failed on {target_host}: {msg}"
+                )
+
+        _remove_hosts_from_inventory(target_hosts)
+        _remove_hosts_from_state(state, target_hosts)
+
+    provision_type = state.data.get("provision", {}).get("type")
+    if provision_type in {"local", "lan"}:
+        if target_hosts:
+            click.secho("Infrastructure destroy complete.", fg="green")
+        else:
+            click.secho("No devices found in CLI context to destroy.", fg="yellow")
         return
 
     ok, msg = run_playbook(
@@ -484,6 +675,19 @@ def bootstrap_control_plane(
 @click.option("--cpu-total", default=0, type=int, show_default=True)
 @click.option("--memory-total-mb", default=0, type=int, show_default=True)
 @click.option(
+    "--base-domain",
+    default=None,
+    help="Base domain for lab host ingress, e.g. example.com",
+)
+@click.option(
+    "--dns-zone", default=None, help="DNS zone to update (defaults to --base-domain)"
+)
+@click.option(
+    "--ingress-target",
+    default=None,
+    help="Ingress endpoint target for wildcard DNS (IP or DNS)",
+)
+@click.option(
     "--become-password",
     default=None,
     help="Sudo password for privilege escalation on the target host",
@@ -497,6 +701,9 @@ def bootstrap_lab_host(
     register_ip: str | None,
     cpu_total: int,
     memory_total_mb: int,
+    base_domain: str | None,
+    dns_zone: str | None,
+    ingress_target: str | None,
     become_password: str | None,
 ) -> None:
     state = InfraState()
@@ -566,6 +773,9 @@ def bootstrap_lab_host(
         "cpu_total": cpu_total,
         "memory_total_mb": memory_total_mb,
         "api_key": lab_host_api_key,
+        "base_domain": base_domain,
+        "dns_zone": dns_zone,
+        "ingress_target": ingress_target,
     }
 
     register_response = _register_lab_host(cp_state, register_payload)
@@ -586,3 +796,342 @@ def bootstrap_lab_host(
     )
 
     click.secho("Lab host bootstrap complete and registered.", fg="green")
+
+
+@cli.group("cp")
+def control_plane() -> None:
+    """Control-plane API commands."""
+
+
+@control_plane.command("health")
+def control_plane_health() -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(cp_state, "GET", "/health")
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane.command("request")
+@click.option(
+    "--method",
+    required=True,
+    type=click.Choice(["GET", "POST", "PUT", "PATCH", "DELETE"]),
+)
+@click.option("--path", required=True, help="Control-plane endpoint path, e.g. /labs")
+@click.option(
+    "--query", default="", help="Query string in key=value&key2=value2 format"
+)
+@click.option("--json", "json_str", default=None, help="Inline JSON object payload")
+@click.option("--json-file", default=None, help="Path to JSON object payload file")
+def control_plane_request(
+    method: str,
+    path: str,
+    query: str,
+    json_str: str | None,
+    json_file: str | None,
+) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    payload = _load_json_from_args(json_str, json_file)
+
+    query_dict: dict[str, str] = {}
+    if query.strip():
+        parsed_qs = parse.parse_qs(query, keep_blank_values=True)
+        query_dict = {k: v[-1] for k, v in parsed_qs.items() if v}
+
+    response = _call_control_plane_api(
+        cp_state,
+        method,
+        path,
+        payload=payload,
+        query=query_dict or None,
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane.group("labs")
+def control_plane_labs() -> None:
+    """Lab management commands."""
+
+
+@control_plane_labs.command("list")
+def control_plane_labs_list() -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(cp_state, "GET", "/labs")
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_labs.command("create")
+@click.option("--name", required=True)
+@click.option("--host-id", required=True, type=int)
+@click.option("--cpu-limit", default=None, type=int)
+@click.option("--memory-limit-mb", default=None, type=int)
+@click.option(
+    "--status", default="stopped", type=click.Choice(["running", "stopped", "failed"])
+)
+def control_plane_labs_create(
+    name: str,
+    host_id: int,
+    cpu_limit: int | None,
+    memory_limit_mb: int | None,
+    status: str,
+) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+
+    payload: dict[str, Any] = {
+        "name": name,
+        "host_id": host_id,
+        "status": status,
+    }
+    if cpu_limit is not None:
+        payload["cpu_limit"] = cpu_limit
+    if memory_limit_mb is not None:
+        payload["memory_limit_mb"] = memory_limit_mb
+
+    response = _call_control_plane_api(cp_state, "POST", "/labs", payload=payload)
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_labs.command("delete")
+@click.option("--name", required=True)
+def control_plane_labs_delete(name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(cp_state, "DELETE", f"/labs/{name}")
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane.group("env")
+def control_plane_env() -> None:
+    """Lab environment (container) commands."""
+
+
+@control_plane_env.command("list")
+@click.option("--lab", "lab_name", required=True)
+def control_plane_env_list(lab_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(cp_state, "GET", f"/lab/{lab_name}/environments")
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_env.command("get")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--name", "container_name", required=True)
+def control_plane_env_get(lab_name: str, container_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(
+        cp_state,
+        "GET",
+        f"/lab/{lab_name}/environments/{container_name}",
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_env.command("deploy")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--image", required=True)
+@click.option("--name", "container_name", required=True)
+@click.option(
+    "--network-mode",
+    required=True,
+    type=click.Choice(
+        [
+            "offline",
+            "internal_private",
+            "internal_exposed",
+            "external_private",
+            "external_exposed",
+        ]
+    ),
+)
+@click.option(
+    "--json",
+    "json_str",
+    default=None,
+    help="Additional JSON object to merge into payload",
+)
+@click.option(
+    "--json-file", default=None, help="JSON file with additional payload fields"
+)
+def control_plane_env_deploy(
+    lab_name: str,
+    image: str,
+    container_name: str,
+    network_mode: str,
+    json_str: str | None,
+    json_file: str | None,
+) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+
+    payload: dict[str, Any] = {
+        "image": image,
+        "name": container_name,
+        "network_mode": network_mode,
+    }
+    extra = _load_json_from_args(json_str, json_file)
+    if extra:
+        payload.update(extra)
+
+    response = _call_control_plane_api(
+        cp_state,
+        "POST",
+        f"/lab/{lab_name}/environments",
+        payload=payload,
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_env.command("delete")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--name", "container_name", required=True)
+def control_plane_env_delete(lab_name: str, container_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(
+        cp_state,
+        "DELETE",
+        f"/lab/{lab_name}/environments/{container_name}",
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_env.command("delete-all")
+@click.option("--lab", "lab_name", required=True)
+def control_plane_env_delete_all(lab_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(
+        cp_state,
+        "DELETE",
+        f"/lab/{lab_name}/environments",
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_env.command("state")
+@click.option("--lab", "lab_name", required=True)
+@click.option(
+    "--action",
+    "action",
+    required=True,
+    type=click.Choice(["stop", "pause", "unpause", "start"]),
+)
+@click.option("--names", required=True, help="Comma-separated container names")
+def control_plane_env_state(lab_name: str, action: str, names: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    payload = {"names": [n.strip() for n in names.split(",") if n.strip()]}
+    response = _call_control_plane_api(
+        cp_state,
+        "POST",
+        f"/lab/{lab_name}/environments/state/{action}",
+        payload=payload,
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane.group("projects")
+def control_plane_projects() -> None:
+    """Lab compose project commands."""
+
+
+@control_plane_projects.command("list")
+@click.option("--lab", "lab_name", required=True)
+def control_plane_projects_list(lab_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(cp_state, "GET", f"/lab/{lab_name}/projects")
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_projects.command("get")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--name", "project_name", required=True)
+def control_plane_projects_get(lab_name: str, project_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(
+        cp_state,
+        "GET",
+        f"/lab/{lab_name}/projects/{project_name}",
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_projects.command("deploy")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--json", "json_str", default=None, help="Inline JSON object payload")
+@click.option("--json-file", default=None, help="Path to JSON object payload file")
+def control_plane_projects_deploy(
+    lab_name: str,
+    json_str: str | None,
+    json_file: str | None,
+) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    payload = _load_json_from_args(json_str, json_file)
+    if payload is None:
+        raise click.ClickException(
+            "Project deploy requires --json or --json-file payload"
+        )
+
+    response = _call_control_plane_api(
+        cp_state,
+        "POST",
+        f"/lab/{lab_name}/projects",
+        payload=payload,
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_projects.command("delete")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--name", "project_name", required=True)
+def control_plane_projects_delete(lab_name: str, project_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(
+        cp_state,
+        "DELETE",
+        f"/lab/{lab_name}/projects/{project_name}",
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_projects.command("delete-all")
+@click.option("--lab", "lab_name", required=True)
+def control_plane_projects_delete_all(lab_name: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    response = _call_control_plane_api(
+        cp_state,
+        "DELETE",
+        f"/lab/{lab_name}/projects",
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_projects.command("state")
+@click.option("--lab", "lab_name", required=True)
+@click.option(
+    "--action",
+    required=True,
+    type=click.Choice(["up", "down", "pull", "start", "stop"]),
+)
+@click.option("--names", required=True, help="Comma-separated project names")
+def control_plane_projects_state(lab_name: str, action: str, names: str) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+    payload = {"names": [n.strip() for n in names.split(",") if n.strip()]}
+    response = _call_control_plane_api(
+        cp_state,
+        "POST",
+        f"/lab/{lab_name}/projects/state/{action}",
+        payload=payload,
+    )
+    click.echo(json.dumps(response, indent=2))

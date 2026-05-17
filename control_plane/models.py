@@ -81,9 +81,18 @@ class ContainerSecurityArgs(BaseModel):
     apparmor_profile: str | None = None
 
 
+class EnvironmentNetworkMode(str, Enum):
+    OFFLINE = "offline"
+    INTERNAL_PRIVATE = "internal_private"
+    INTERNAL_EXPOSED = "internal_exposed"
+    EXTERNAL_PRIVATE = "external_private"
+    EXTERNAL_EXPOSED = "external_exposed"
+
+
 class DeployEnvironmentRequest(BaseModel):
     image: str
     name: str
+    network_mode: EnvironmentNetworkMode
     command: str | None = None
     env: dict[str, str] | None = None
     ports: list[PortMapping] | None = None
@@ -114,6 +123,9 @@ class RegisterHostRequest(BaseModel):
     cpu_total: int = Field(ge=0)
     memory_total_mb: int = Field(ge=0)
     api_key: str = Field(min_length=1)
+    base_domain: str | None = Field(default=None, min_length=1, max_length=255)
+    dns_zone: str | None = Field(default=None, min_length=1, max_length=255)
+    ingress_target: str | None = Field(default=None, min_length=1, max_length=255)
 
 
 class CallLabHostRequest(BaseModel):
@@ -146,6 +158,8 @@ class ComposeDeployRequest(BaseModel):
     env: dict[str, str] | None = None
     pull: bool = True
     build: bool = False
+    network_mode: EnvironmentNetworkMode = EnvironmentNetworkMode.INTERNAL_PRIVATE
+    exposed_services: list[str] | None = None
     cpu_limit: float | None = None
     memory_limit: str | None = None
 

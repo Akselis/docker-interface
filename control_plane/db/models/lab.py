@@ -33,6 +33,16 @@ class Lab(Base):
         nullable=False,
         default=LabStatus.STOPPED,
     )
+    default_internal_network_id: Mapped[int | None] = mapped_column(
+        ForeignKey("networks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    default_external_network_id: Mapped[int | None] = mapped_column(
+        ForeignKey("networks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     cpu_limit: Mapped[int | None] = mapped_column(nullable=True)
     memory_limit_mb: Mapped[int | None] = mapped_column(nullable=True)
     created_at_utc: Mapped[datetime] = mapped_column(

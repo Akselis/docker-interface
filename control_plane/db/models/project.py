@@ -15,6 +15,13 @@ class ComposeSourceType(str, Enum):
     INLINE = "inline"
 
 
+class ProjectNetworkMode(str, Enum):
+    INTERNAL_PRIVATE = "internal_private"
+    INTERNAL_EXPOSED = "internal_exposed"
+    EXTERNAL_PRIVATE = "external_private"
+    EXTERNAL_EXPOSED = "external_exposed"
+
+
 class Project(Base):
     __tablename__ = "projects"
     __table_args__ = (
@@ -47,6 +54,12 @@ class Project(Base):
 
     pull: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     build: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    network_mode: Mapped[ProjectNetworkMode] = mapped_column(
+        SAEnum(ProjectNetworkMode, name="project_network_mode_enum"),
+        nullable=False,
+        default=ProjectNetworkMode.INTERNAL_PRIVATE,
+    )
+    exposed_services: Mapped[list[str] | None] = mapped_column(JSON, nullable=True)
     cpu_limit: Mapped[float | None] = mapped_column(Float, nullable=True)
     memory_limit_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
 

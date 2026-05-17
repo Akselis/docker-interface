@@ -66,7 +66,7 @@
           LAB_HOST_ID: "{{ lab_host_effective_id }}"
           RABBITMQ_URL: "{{ lab_host_rabbitmq_url | default('amqp://guest:guest@localhost:5672/%2F') }}"
           RABBITMQ_EXCHANGE: "{{ lab_host_rabbitmq_exchange | default('lab.events') }}"
-          HEARTBEAT_INTERVAL_SECONDS: "{{ lab_host_heartbeat_interval | default(10) }}"
+          HEARTBEAT_INTERVAL_SECONDS: "{{ (lab_host_heartbeat_interval | default(10)) | string }}"
 
     - name: Persist effective LAB_HOST_ID to local artifact
       ansible.builtin.copy:

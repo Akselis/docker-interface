@@ -1,0 +1,22 @@
+---
+- hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    keep_volumes: true
+
+  tasks:
+    - name: List running docker containers
+      ansible.builtin.command: docker ps -q
+      register: running_container_ids
+      changed_when: false
+
+    - name: Remove running docker containers
+      ansible.builtin.command:
+        cmd: >-
+          docker rm -f
+          {% if not keep_volumes %}-v{% endif %}
+          {{ item }}
+      loop: "{{ running_container_ids.stdout_lines }}"
+      when: running_container_ids.stdout_lines | length > 0

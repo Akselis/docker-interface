@@ -470,7 +470,7 @@ def create_container(args: ContainerArgs) -> Container:
     kwargs = build_container_kwargs(args)
     container = client.containers.run(**kwargs, detach=True)
 
-    if args.network:
+    if args.network and args.network[0].name != "none":
         container.reload()
         attrs = container.attrs if isinstance(container.attrs, dict) else {}
         network_settings = attrs.get("NetworkSettings")
@@ -485,7 +485,9 @@ def create_container(args: ContainerArgs) -> Container:
             else set()
         )
 
-        for net in args.network:
+        for index, net in enumerate(args.network):
+            if index == 0:
+                continue
             if net.name in current_networks:
                 continue
             network = client.networks.get(net.name)

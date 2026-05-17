@@ -1,9 +1,11 @@
 local:
+  hosts: {}
+control_plane:
   hosts:
     localhost:
       ansible_connection: local
       ansible_host: 127.0.0.1
-control_plane:
+lab_hosts:
   hosts:
     localhost:
       ansible_connection: local

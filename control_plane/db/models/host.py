@@ -31,6 +31,9 @@ class Host(Base):
         nullable=False,
         default=HostStatus.OFFLINE,
     )
+    base_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    dns_zone: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ingress_target: Mapped[str | None] = mapped_column(String(255), nullable=True)
     cpu_total: Mapped[int] = mapped_column(nullable=False)
     memory_total_mb: Mapped[int] = mapped_column(nullable=False)
     created_at_utc: Mapped[datetime] = mapped_column(
