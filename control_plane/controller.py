@@ -5,6 +5,7 @@ from typing import Literal
 
 import httpx
 from controller_helpers import (
+    calculate_lab_allocated_resources,
     call_lab_host,
     enforce_resource_capacity,
     extract_body,
@@ -21,10 +22,10 @@ from controller_helpers import (
     to_container_status,
 )
 from db.models.container import Container
-from db.models.host import Host
+from db.models.host import Host, HostStatus
 from db.models.lab import Lab, LabStatus
 from db.models.network import Network, NetworkDriver
-from db.models.project import Project, ProjectNetworkMode
+from db.models.project import Project, ProjectDesiredState, ProjectNetworkMode
 from db.repos.container import ContainerRepository
 from db.repos.host import HostRepository
 from db.repos.lab import LabRepository
@@ -195,6 +196,94 @@ async def _delete_ingress_route_if_possible(
     )
     ingress = get_ingress_provider()
     await ingress.delete_route(hostname=fqdn)
+
+
+def _lab_load_score(
+    lab: Lab, host: Host, cpu_used: float, memory_used_mb: int
+) -> float:
+    cpu_capacity = (
+        float(lab.cpu_limit) if lab.cpu_limit is not None else float(host.cpu_total)
+    )
+    memory_capacity = (
+        float(lab.memory_limit_mb)
+        if lab.memory_limit_mb is not None
+        else float(host.memory_total_mb)
+    )
+
+    cpu_ratio = (cpu_used / cpu_capacity) if cpu_capacity > 0 else 1.0
+    memory_ratio = (memory_used_mb / memory_capacity) if memory_capacity > 0 else 1.0
+    return max(cpu_ratio, memory_ratio)
+
+
+async def _select_target_lab(
+    *,
+    scheduling_method: Literal["first_fit", "least_allocated"],
+    requested_cpu: float | None,
+    requested_memory_mb: int | None,
+    session: AsyncSession,
+) -> tuple[Lab, Host]:
+    lab_repo = LabRepository(session)
+    host_repo = HostRepository(session)
+    container_repo = ContainerRepository(session)
+    project_repo = ProjectRepository(session)
+
+    labs = await lab_repo.list_all()
+    if not labs:
+        raise HTTPException(status_code=404, detail="No labs are available")
+
+    candidates: list[tuple[Lab, Host, float, int]] = []
+
+    for lab in labs:
+        if lab.status == LabStatus.FAILED:
+            continue
+
+        host = await host_repo.get_by_id(lab.host_id)
+        if host is None or host.status != HostStatus.ONLINE:
+            continue
+
+        try:
+            await enforce_resource_capacity(
+                lab=lab,
+                host=host,
+                requested_cpu=requested_cpu,
+                requested_memory_mb=requested_memory_mb,
+                existing_cpu=None,
+                existing_memory_mb=None,
+                resource_kind="scheduled deployment",
+                lab_repo=lab_repo,
+                container_repo=container_repo,
+                project_repo=project_repo,
+            )
+        except HTTPException as exc:
+            if exc.status_code in {404, 409}:
+                continue
+            raise
+
+        cpu_used, memory_used_mb = await calculate_lab_allocated_resources(
+            lab.id,
+            container_repo,
+            project_repo,
+        )
+        candidates.append((lab, host, cpu_used, memory_used_mb))
+
+    if not candidates:
+        raise HTTPException(
+            status_code=409,
+            detail="No eligible lab has enough capacity for this deployment",
+        )
+
+    if scheduling_method == "least_allocated":
+        candidates.sort(
+            key=lambda item: (
+                _lab_load_score(item[0], item[1], item[2], item[3]),
+                item[0].id,
+            )
+        )
+    else:
+        candidates.sort(key=lambda item: item[0].id)
+
+    selected_lab, selected_host, _, _ = candidates[0]
+    return selected_lab, selected_host
 
 
 @app.on_event("startup")
@@ -1278,7 +1367,10 @@ async def deploy_lab_project(
                 pull=payload.pull,
                 build=payload.build,
                 network_mode=network_mode,
+                desired_state=ProjectDesiredState.RUNNING,
                 exposed_services=exposed_services or None,
+                lifetime_type=payload.lifetime_type,
+                time_to_live_seconds=payload.time_to_live_seconds,
                 cpu_limit=requested_cpu,
                 memory_limit_mb=requested_memory_mb,
             )
@@ -1293,7 +1385,10 @@ async def deploy_lab_project(
         row.pull = payload.pull
         row.build = payload.build
         row.network_mode = network_mode
+        row.desired_state = ProjectDesiredState.RUNNING
         row.exposed_services = exposed_services or None
+        row.lifetime_type = payload.lifetime_type
+        row.time_to_live_seconds = payload.time_to_live_seconds
         row.cpu_limit = requested_cpu
         row.memory_limit_mb = requested_memory_mb
         await project_repo.update(row)
@@ -1309,6 +1404,74 @@ async def deploy_lab_project(
     if ingress_routes:
         response["ingress_routes"] = ingress_routes
     return response
+
+
+@app.post("/environments/scheduled", status_code=status.HTTP_201_CREATED)
+async def deploy_environment_scheduled(
+    payload: DeployEnvironmentRequest,
+    scheduling_method: Literal["first_fit", "least_allocated"] = "least_allocated",
+    session: AsyncSession = Depends(get_session),
+):
+    requested_cpu = (
+        float(payload.resources.cpu_count)
+        if payload.resources is not None and payload.resources.cpu_count is not None
+        else None
+    )
+    try:
+        requested_memory_mb = parse_memory_limit_to_mb(
+            payload.resources.memory_limit if payload.resources is not None else None
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    selected_lab, _ = await _select_target_lab(
+        scheduling_method=scheduling_method,
+        requested_cpu=requested_cpu,
+        requested_memory_mb=requested_memory_mb,
+        session=session,
+    )
+
+    deploy_result = await deploy_lab_environment(
+        lab_name=selected_lab.name,
+        payload=payload,
+        session=session,
+    )
+    return {
+        "scheduling_method": scheduling_method,
+        "selected_lab": serialize_lab(selected_lab),
+        **deploy_result,
+    }
+
+
+@app.post("/projects/scheduled", status_code=status.HTTP_201_CREATED)
+async def deploy_project_scheduled(
+    payload: ComposeDeployRequest,
+    scheduling_method: Literal["first_fit", "least_allocated"] = "least_allocated",
+    session: AsyncSession = Depends(get_session),
+):
+    requested_cpu = float(payload.cpu_limit) if payload.cpu_limit is not None else None
+    try:
+        requested_memory_mb = parse_memory_limit_to_mb(payload.memory_limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    selected_lab, _ = await _select_target_lab(
+        scheduling_method=scheduling_method,
+        requested_cpu=requested_cpu,
+        requested_memory_mb=requested_memory_mb,
+        session=session,
+    )
+
+    deploy_result = await deploy_lab_project(
+        lab_name=selected_lab.name,
+        payload=payload,
+        session=session,
+    )
+    return {
+        "scheduling_method": scheduling_method,
+        "selected_lab": serialize_lab(selected_lab),
+        **deploy_result,
+    }
 
 
 @app.delete("/lab/{lab_name}/environments")
@@ -1697,6 +1860,11 @@ async def set_lab_projects_state(
                 }
             )
             continue
+
+        if state in {"up", "start"}:
+            await project_repo.set_desired_state(row, ProjectDesiredState.RUNNING)
+        elif state in {"down", "stop"}:
+            await project_repo.set_desired_state(row, ProjectDesiredState.STOPPED)
 
         changed.append(
             {

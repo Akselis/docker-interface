@@ -100,11 +100,15 @@ def summarize_container(container: Container, full: bool = False) -> dict[str, o
         else str(container.image.short_id)
     )
 
+    state_obj = attrs.get("State") if isinstance(attrs.get("State"), dict) else {}
+    exit_code_obj = state_obj.get("ExitCode") if isinstance(state_obj, dict) else None
+
     basic: dict[str, object] = {
         "id": str(container.id),
         "name": str(container.name),
         "image": str(image_ref),
         "status": str(container.status or "unknown"),
+        "exit_code": exit_code_obj if isinstance(exit_code_obj, int) else None,
         "labels": labels,
         "networks": [str(name) for name in networks_map.keys()],
     }

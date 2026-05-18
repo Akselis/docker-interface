@@ -160,6 +160,8 @@ class ComposeDeployRequest(BaseModel):
     build: bool = False
     network_mode: EnvironmentNetworkMode = EnvironmentNetworkMode.INTERNAL_PRIVATE
     exposed_services: list[str] | None = None
+    lifetime_type: LifetimeType = LifetimeType.PERSISTENT
+    time_to_live_seconds: int | None = None
     cpu_limit: float | None = None
     memory_limit: str | None = None
 
@@ -175,4 +177,11 @@ class ComposeDeployRequest(BaseModel):
     def validate_memory_limit(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("memory_limit cannot be empty")
+        return value
+
+    @field_validator("time_to_live_seconds")
+    @classmethod
+    def validate_ttl(cls, value: int | None) -> int | None:
+        if value is not None and value <= 0:
+            raise ValueError("time_to_live_seconds must be greater than 0")
         return value

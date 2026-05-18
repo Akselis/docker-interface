@@ -1,12 +1,14 @@
 # pyright: reportMissingImports=false
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
 from typing import Any
 
 import pika
+from reconciliation import reconcile_heartbeat_payload
 
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F")
 RABBITMQ_EXCHANGE = os.getenv("RABBITMQ_EXCHANGE", "lab.events")
@@ -15,10 +17,7 @@ RABBITMQ_ROUTING_KEY_PATTERN = os.getenv("RABBITMQ_ROUTING_KEY_PATTERN", "heartb
 
 
 def handle_heartbeat(payload: dict[str, Any]) -> None:
-    """
-    TODO: implement heartbeat handling logic.
-    """
-    _ = payload
+    asyncio.run(reconcile_heartbeat_payload(payload))
 
 
 def _consume_forever() -> None:
