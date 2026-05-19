@@ -14,4 +14,4 @@ if [ "$#" -eq 0 ] || [ "$1" = "shell" ]; then
   done
 fi
 
-exec python /app/cli/evlab.py "$@"
+exec python3 /app/cli/evlab.py "$@"
