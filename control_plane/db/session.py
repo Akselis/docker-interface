@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.pool import NullPool
 
 DB_URL = os.getenv(DATABASE_URL_ENV_VAR)
 
@@ -39,6 +40,7 @@ ASYNC_DB_URL = _to_async_url(DB_URL)
 engine = create_async_engine(
     ASYNC_DB_URL,
     pool_pre_ping=True,
+    poolclass=NullPool,
 )
 
 SessionFactory = async_sessionmaker(

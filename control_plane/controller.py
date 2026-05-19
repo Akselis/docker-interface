@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime
 from typing import Literal
@@ -416,9 +417,10 @@ async def _select_target_host_for_lab(
 
 
 @app.on_event("startup")
-def startup_event() -> None:
+async def startup_event() -> None:
     logger.info("Starting control-plane heartbeat consumer thread")
-    start_consumer_thread()
+    loop = asyncio.get_running_loop()
+    start_consumer_thread(loop)
 
 
 @app.post("/hosts/register")

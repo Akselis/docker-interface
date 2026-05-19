@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+from concurrent.futures import Future
 from typing import Any
 
 import pika
@@ -19,15 +20,33 @@ RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "45"))
 
 logger = logging.getLogger(__name__)
 
+_RECONCILE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _set_reconcile_loop(loop: asyncio.AbstractEventLoop) -> None:
+    global _RECONCILE_LOOP
+    _RECONCILE_LOOP = loop
+
+
+def _submit_reconcile(payload: dict[str, Any]) -> Future[None]:
+    if _RECONCILE_LOOP is None:
+        raise RuntimeError("Reconcile loop is not configured")
+    return asyncio.run_coroutine_threadsafe(
+        reconcile_heartbeat_payload(payload),
+        _RECONCILE_LOOP,
+    )
+
 
 def handle_heartbeat(payload: dict[str, Any]) -> None:
-    asyncio.run(reconcile_heartbeat_payload(payload))
+    future = _submit_reconcile(payload)
+    future.result()
 
 
 def _periodic_reconcile_forever() -> None:
     while True:
         try:
-            asyncio.run(reconcile_heartbeat_payload({}))
+            future = _submit_reconcile({})
+            future.result()
         except Exception as exc:
             logger.warning("Periodic reconciliation failed: %s", exc)
         finally:
@@ -69,7 +88,9 @@ def _consume_forever() -> None:
     channel.start_consuming()
 
 
-def start_consumer_thread() -> threading.Thread:
+def start_consumer_thread(loop: asyncio.AbstractEventLoop) -> threading.Thread:
+    _set_reconcile_loop(loop)
+
     periodic = threading.Thread(
         target=_periodic_reconcile_forever,
         name="control-plane-periodic-reconcile",
