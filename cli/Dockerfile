@@ -46,4 +46,4 @@ RUN chmod +x /app/cli/scripts/entrypoint.sh \
     && sed -i 's/\r$//' /app/cli/scripts/entrypoint.sh
 
 ENTRYPOINT ["/app/cli/scripts/entrypoint.sh"]
-CMD ["--help"]
+CMD ["shell"]

@@ -1,17 +1,24 @@
 #!/bin/sh
-set -e
+set -u
 
 if [ "$#" -eq 0 ] || [ "$1" = "shell" ]; then
   while true; do
     printf "evlab> "
     IFS= read -r line || exit 0
     [ -z "$line" ] && continue
+
     case "$line" in
       exit|quit) exit 0 ;;
     esac
+
     set -- $line
-    python /app/cli/evlab.py "$@"
+    if python /app/cli/evlab.py "$@"; then
+      :
+    else
+      rc=$?
+      echo "Command failed with exit code $rc (shell stays open)"
+    fi
   done
 fi
 
-exec python3 /app/cli/evlab.py "$@"
+exec python /app/cli/evlab.py "$@"
