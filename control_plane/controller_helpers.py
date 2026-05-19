@@ -72,6 +72,10 @@ def serialize_lab(lab: Lab) -> dict[str, object]:
     }
 
 
+def is_host_unbounded(host: Host) -> bool:
+    return int(host.cpu_total) == 0 and int(host.memory_total_mb) == 0
+
+
 def parse_memory_limit_to_mb(memory_limit: str | None) -> int | None:
     if memory_limit is None:
         return None
@@ -213,6 +217,9 @@ async def enforce_resource_capacity(
     container_repo: ContainerRepository,
     project_repo: ProjectRepository,
 ) -> None:
+    if is_host_unbounded(host):
+        return
+
     lab_cpu_used, lab_memory_used = await calculate_lab_allocated_resources(
         lab.id,
         container_repo,

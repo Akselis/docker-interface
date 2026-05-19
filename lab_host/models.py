@@ -1,6 +1,7 @@
 from enum import Enum
+from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class NetworkDriver(str, Enum):
@@ -165,3 +166,18 @@ class ExecCommandRequest(BaseModel):
     user: str | None = None
     environment: dict[str, str] | None = None
     privileged: bool = False
+
+
+class IngressEnsureArgs(BaseModel):
+    image: str = "traefik:v3.1"
+    container_name: str = "lab-host-ingress"
+    http_port: int = Field(default=80, ge=1, le=65535)
+    https_port: int = Field(default=443, ge=1, le=65535)
+    network_mode: Literal["host", "bridge"] = "host"
+
+
+class IngressRouteUpsertArgs(BaseModel):
+    upstream_host: str = Field(min_length=1)
+    upstream_port: int = Field(ge=1, le=65535)
+    service_scheme: Literal["http", "https"] = "http"
+    metadata: dict[str, str] | None = None

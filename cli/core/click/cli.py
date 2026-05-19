@@ -16,6 +16,7 @@ from core.infra.state import InfraState
 
 CONTROL_PLANE_DEFAULT_IMAGE = "ghcr.io/akselis/control-plane:latest"
 LAB_HOST_DEFAULT_IMAGE = "ghcr.io/akselis/lab-host:latest"
+INGRESS_DEFAULT_IMAGE = "traefik:v3.1"
 CONTROL_PLANE_CONTAINER_NAME = "control-plane-api"
 
 
@@ -331,6 +332,51 @@ def _control_plane_state_or_fail(state: InfraState) -> dict[str, Any]:
     return cp_state
 
 
+def _resolve_control_plane_host_id(state: InfraState, host_ref: str) -> int:
+    ref = host_ref.strip()
+    if not ref:
+        raise click.ClickException("--host-id cannot be empty")
+
+    if ref.isdigit():
+        host_id = int(ref)
+        if host_id <= 0:
+            raise click.ClickException("--host-id must be a positive integer")
+        return host_id
+
+    lab_hosts = state.data.get("lab_hosts") if isinstance(state.data, dict) else None
+    if isinstance(lab_hosts, dict):
+        for host_key, host_value in lab_hosts.items():
+            if not isinstance(host_key, str) or not isinstance(host_value, dict):
+                continue
+
+            candidates: set[str] = {host_key}
+            for key in ("lab_host_id", "target_host", "ansible_host", "register_ip"):
+                value = host_value.get(key)
+                if isinstance(value, str) and value:
+                    candidates.add(value)
+
+            response_obj = host_value.get("register_response")
+            if isinstance(response_obj, dict):
+                host_obj = response_obj.get("host")
+                if isinstance(host_obj, dict):
+                    hostname = host_obj.get("hostname")
+                    ip_address = host_obj.get("ip_address")
+                    host_id_obj = host_obj.get("id")
+
+                    if isinstance(hostname, str) and hostname:
+                        candidates.add(hostname)
+                    if isinstance(ip_address, str) and ip_address:
+                        candidates.add(ip_address)
+
+                    if ref in candidates and isinstance(host_id_obj, int):
+                        return host_id_obj
+
+    raise click.ClickException(
+        "Could not resolve --host-id. Use numeric control-plane host id or a known "
+        "registered lab host reference (lab_host_id/hostname/ip)."
+    )
+
+
 def _call_control_plane_api(
     control_plane: dict[str, Any],
     method: str,
@@ -377,6 +423,46 @@ def _call_control_plane_api(
         raise click.ClickException(f"Failed to reach control plane: {exc}") from exc
 
 
+def _call_lab_host_api(
+    *,
+    host: str,
+    port: int,
+    scheme: str,
+    api_key: str,
+    method: str,
+    endpoint_path: str,
+    payload: dict[str, Any] | None = None,
+    query: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    path = endpoint_path if endpoint_path.startswith("/") else f"/{endpoint_path}"
+    url = f"{scheme}://{host}:{port}{path}"
+    if query:
+        url = f"{url}?{parse.urlencode(query)}"
+
+    body = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = request.Request(
+        url=url,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-API-Key": api_key,
+        },
+        method=method,
+    )
+
+    try:
+        with request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8")
+            return json.loads(content) if content else {}
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise click.ClickException(
+            f"Lab-host request failed. {method} {path} HTTP {exc.code}: {detail}"
+        ) from exc
+    except error.URLError as exc:
+        raise click.ClickException(f"Failed to reach lab-host: {exc}") from exc
+
+
 def _register_lab_host(
     control_plane: dict[str, Any], payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -386,6 +472,35 @@ def _register_lab_host(
         endpoint_path="/hosts/register",
         payload=payload,
     )
+
+
+def _ensure_firewall_ports(
+    *,
+    target_host: str,
+    become_password: str,
+    allow_tcp_ports: list[int],
+) -> None:
+    ports = sorted({int(p) for p in allow_tcp_ports if int(p) > 0})
+    if not ports:
+        return
+
+    if _is_loopback_host(target_host) and os.path.exists("/.dockerenv"):
+        click.secho(
+            "Skipping firewall automation for containerized localhost target.",
+            fg="yellow",
+        )
+        return
+
+    ok, msg = run_playbook(
+        "host.ensure.firewall.yaml",
+        {
+            "target_host": target_host,
+            "ansible_become_password": become_password,
+            "firewall_allow_tcp_ports": ports,
+        },
+    )
+    if not ok:
+        raise click.ClickException(f"Firewall setup failed: {msg}")
 
 
 def _load_json_from_args(
@@ -717,6 +832,11 @@ def infra_bootstrap() -> None:
     help="Sudo password for privilege escalation on the target host",
     hide_input=True,
 )
+@click.option(
+    "--configure-firewall/--no-configure-firewall",
+    default=True,
+    show_default=True,
+)
 def bootstrap_control_plane(
     device: str,
     control_plane_api_key: str,
@@ -726,13 +846,16 @@ def bootstrap_control_plane(
     rabbitmq_user: str,
     rabbitmq_password: str,
     become_password: str | None,
+    configure_firewall: bool,
 ) -> None:
     state = InfraState()
     target_host, host_vars = _ensure_inventory_host("control_plane", device)
 
+    resolved_become_password = _resolve_become_password(become_password)
+
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
-        "ansible_become_password": _resolve_become_password(become_password),
+        "ansible_become_password": resolved_become_password,
     }
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
@@ -746,6 +869,11 @@ def bootstrap_control_plane(
         else "local"
     )
 
+    ports_artifact = os.path.join(
+        dir.ARTIFACTS_DIR,
+        f"control_plane_ports_{_slugify_for_filename(target_host)}.json",
+    )
+
     deploy_vars = {
         **common_extravars,
         "control_plane_image": control_plane_image,
@@ -756,6 +884,7 @@ def bootstrap_control_plane(
         "control_plane_rabbitmq_user": rabbitmq_user,
         "control_plane_rabbitmq_password": rabbitmq_password,
         "control_plane_deployment_type": provision_type,
+        "control_plane_ports_output_file": ports_artifact,
     }
 
     ok, msg = run_playbook("control_plane.deploy.yaml", deploy_vars)
@@ -763,7 +892,39 @@ def bootstrap_control_plane(
         raise click.ClickException(f"Control plane deploy failed: {msg}")
 
     ansible_host = str(host_vars.get("ansible_host") or target_host)
-    rabbitmq_url = f"amqp://{rabbitmq_user}:{rabbitmq_password}@{ansible_host}:5672/%2F"
+
+    effective_control_plane_port = control_plane_port
+    effective_rabbitmq_port = 5672
+    if os.path.exists(ports_artifact):
+        with open(ports_artifact, "r", encoding="utf-8") as f:
+            ports_payload = json.load(f)
+        if isinstance(ports_payload, dict):
+            cp_port_obj = ports_payload.get("control_plane_port")
+            rabbit_port_obj = ports_payload.get("rabbitmq_port")
+            if isinstance(cp_port_obj, int) and cp_port_obj > 0:
+                effective_control_plane_port = cp_port_obj
+            if isinstance(rabbit_port_obj, int) and rabbit_port_obj > 0:
+                effective_rabbitmq_port = rabbit_port_obj
+
+    if effective_control_plane_port != control_plane_port:
+        click.secho(
+            f"Requested control-plane port {control_plane_port} is busy; using {effective_control_plane_port}.",
+            fg="yellow",
+        )
+    if effective_rabbitmq_port != 5672:
+        click.secho(
+            f"Requested RabbitMQ port 5672 is busy; using {effective_rabbitmq_port}.",
+            fg="yellow",
+        )
+
+    if configure_firewall:
+        _ensure_firewall_ports(
+            target_host=target_host,
+            become_password=resolved_become_password,
+            allow_tcp_ports=[effective_control_plane_port, effective_rabbitmq_port],
+        )
+
+    rabbitmq_url = f"amqp://{rabbitmq_user}:{rabbitmq_password}@{ansible_host}:{effective_rabbitmq_port}/%2F"
 
     state.set_control_plane(
         {
@@ -771,7 +932,7 @@ def bootstrap_control_plane(
             "host": ansible_host,
             "ansible_host": ansible_host,
             "scheme": "http",
-            "port": control_plane_port,
+            "port": effective_control_plane_port,
             "api_key": control_plane_api_key,
             "env": {
                 "RABBITMQ_URL": rabbitmq_url,
@@ -821,6 +982,15 @@ def bootstrap_control_plane(
     help="Sudo password for privilege escalation on the target host",
     hide_input=True,
 )
+@click.option("--use-routing/--no-use-routing", default=False, show_default=True)
+@click.option("--ingress-image", default=INGRESS_DEFAULT_IMAGE, show_default=True)
+@click.option("--ingress-http-port", default=80, type=int, show_default=True)
+@click.option("--ingress-https-port", default=443, type=int, show_default=True)
+@click.option(
+    "--configure-firewall/--no-configure-firewall",
+    default=True,
+    show_default=True,
+)
 def bootstrap_lab_host(
     device: str,
     lab_host_api_key: str,
@@ -834,6 +1004,11 @@ def bootstrap_lab_host(
     dns_zone: str | None,
     ingress_target: str | None,
     become_password: str | None,
+    use_routing: bool,
+    ingress_image: str,
+    ingress_http_port: int,
+    ingress_https_port: int,
+    configure_firewall: bool,
 ) -> None:
     state = InfraState()
     cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
@@ -844,9 +1019,11 @@ def bootstrap_lab_host(
 
     target_host, host_vars = _ensure_inventory_host("lab_hosts", device)
 
+    resolved_become_password = _resolve_become_password(become_password)
+
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
-        "ansible_become_password": _resolve_become_password(become_password),
+        "ansible_become_password": resolved_become_password,
     }
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
@@ -898,6 +1075,10 @@ def bootstrap_lab_host(
         dir.ARTIFACTS_DIR,
         f"lab_host_id_{_slugify_for_filename(target_host)}.txt",
     )
+    port_artifact = os.path.join(
+        dir.ARTIFACTS_DIR,
+        f"lab_host_port_{_slugify_for_filename(target_host)}.txt",
+    )
 
     deploy_vars = {
         **common_extravars,
@@ -907,6 +1088,7 @@ def bootstrap_lab_host(
         "lab_host_host_port": lab_host_port,
         "lab_host_rabbitmq_url": rabbitmq_url,
         "lab_host_id_output_file": id_artifact,
+        "lab_host_port_output_file": port_artifact,
     }
     if lab_host_id:
         deploy_vars["lab_host_id"] = lab_host_id
@@ -915,6 +1097,91 @@ def bootstrap_lab_host(
     if not ok:
         raise click.ClickException(f"Lab host deploy failed: {msg}")
 
+    effective_lab_host_port = lab_host_port
+    if os.path.exists(port_artifact):
+        with open(port_artifact, "r", encoding="utf-8") as f:
+            port_text = f.read().strip()
+        if port_text.isdigit() and int(port_text) > 0:
+            effective_lab_host_port = int(port_text)
+
+    if effective_lab_host_port != lab_host_port:
+        click.secho(
+            f"Requested lab-host port {lab_host_port} is busy; using {effective_lab_host_port}.",
+            fg="yellow",
+        )
+
+    effective_ingress_http_port: int | None = None
+    effective_ingress_https_port: int | None = None
+
+    if use_routing:
+        if not isinstance(base_domain, str) or not base_domain.strip():
+            raise click.ClickException(
+                "--base-domain is required when --use-routing is enabled"
+            )
+
+        ingress_response = _call_lab_host_api(
+            host=ansible_host,
+            port=effective_lab_host_port,
+            scheme="http",
+            api_key=lab_host_api_key,
+            method="POST",
+            endpoint_path="/ingress/ensure",
+            payload={
+                "image": ingress_image,
+                "http_port": ingress_http_port,
+                "https_port": ingress_https_port,
+                "network_mode": "host",
+            },
+        )
+
+        ingress_obj = (
+            ingress_response.get("ingress")
+            if isinstance(ingress_response, dict)
+            else None
+        )
+        ingress_details = (
+            ingress_obj.get("ingress") if isinstance(ingress_obj, dict) else None
+        )
+        if isinstance(ingress_details, dict):
+            http_obj = ingress_details.get("http_port")
+            https_obj = ingress_details.get("https_port")
+            if isinstance(http_obj, int) and http_obj > 0:
+                effective_ingress_http_port = http_obj
+            if isinstance(https_obj, int) and https_obj > 0:
+                effective_ingress_https_port = https_obj
+
+        if (
+            effective_ingress_http_port is not None
+            and effective_ingress_http_port != ingress_http_port
+        ):
+            click.secho(
+                f"Requested ingress HTTP port {ingress_http_port} is busy; using {effective_ingress_http_port}.",
+                fg="yellow",
+            )
+        if (
+            effective_ingress_https_port is not None
+            and effective_ingress_https_port != ingress_https_port
+        ):
+            click.secho(
+                f"Requested ingress HTTPS port {ingress_https_port} is busy; using {effective_ingress_https_port}.",
+                fg="yellow",
+            )
+
+    if configure_firewall:
+        firewall_ports = [effective_lab_host_port]
+        if use_routing:
+            firewall_ports.extend(
+                [
+                    effective_ingress_http_port or ingress_http_port,
+                    effective_ingress_https_port or ingress_https_port,
+                ]
+            )
+        _ensure_firewall_ports(
+            target_host=target_host,
+            become_password=resolved_become_password,
+            allow_tcp_ports=firewall_ports,
+        )
+
     effective_lab_host_id = register_host_name
     if os.path.exists(id_artifact):
         with open(id_artifact, "r", encoding="utf-8") as f:
@@ -922,10 +1189,16 @@ def bootstrap_lab_host(
         if artifact_id:
             effective_lab_host_id = artifact_id
 
+    effective_ingress_target = ingress_target
+    if use_routing and (
+        not isinstance(effective_ingress_target, str) or not effective_ingress_target
+    ):
+        effective_ingress_target = register_host_value
+
     register_payload = {
         "hostname": effective_lab_host_id,
         "ip_address": register_host_value,
-        "port": lab_host_port,
+        "port": effective_lab_host_port,
         "scheme": "http",
         "status": "online",
         "cpu_total": cpu_total,
@@ -933,7 +1206,7 @@ def bootstrap_lab_host(
         "api_key": lab_host_api_key,
         "base_domain": base_domain,
         "dns_zone": dns_zone,
-        "ingress_target": ingress_target,
+        "ingress_target": effective_ingress_target,
     }
 
     register_response = _register_lab_host(cp_state, register_payload)
@@ -944,12 +1217,26 @@ def bootstrap_lab_host(
             "target_host": target_host,
             "ansible_host": ansible_host,
             "register_ip": register_host_value,
-            "port": lab_host_port,
+            "port": effective_lab_host_port,
             "api_key": lab_host_api_key,
             "lab_host_id": effective_lab_host_id,
             "register_response": register_response,
             "rabbitmq_url": rabbitmq_url,
             "lab_host_id_artifact": id_artifact,
+            "lab_host_port_artifact": port_artifact,
+            "routing_enabled": use_routing,
+            "ingress_image": ingress_image if use_routing else None,
+            "ingress_http_port": (
+                (effective_ingress_http_port or ingress_http_port)
+                if use_routing
+                else None
+            ),
+            "ingress_https_port": (
+                (effective_ingress_https_port or ingress_https_port)
+                if use_routing
+                else None
+            ),
+            "ingress_target": effective_ingress_target,
         },
     )
 
@@ -1022,7 +1309,19 @@ def control_plane_labs_list() -> None:
 
 @control_plane_labs.command("create")
 @click.option("--name", required=True)
-@click.option("--host-id", required=True, type=int)
+@click.option(
+    "--host-id",
+    required=False,
+    type=str,
+    default=None,
+    help="Control-plane host numeric id or known lab-host reference (lab_host_id/hostname/ip). Omit to schedule automatically.",
+)
+@click.option(
+    "--scheduling-method",
+    default="least_allocated",
+    show_default=True,
+    type=click.Choice(["first_fit", "least_allocated"]),
+)
 @click.option("--cpu-limit", default=None, type=int)
 @click.option("--memory-limit-mb", default=None, type=int)
 @click.option(
@@ -1030,7 +1329,8 @@ def control_plane_labs_list() -> None:
 )
 def control_plane_labs_create(
     name: str,
-    host_id: int,
+    host_id: str | None,
+    scheduling_method: str,
     cpu_limit: int | None,
     memory_limit_mb: int | None,
     status: str,
@@ -1040,7 +1340,6 @@ def control_plane_labs_create(
 
     payload: dict[str, Any] = {
         "name": name,
-        "host_id": host_id,
         "status": status,
     }
     if cpu_limit is not None:
@@ -1048,7 +1347,19 @@ def control_plane_labs_create(
     if memory_limit_mb is not None:
         payload["memory_limit_mb"] = memory_limit_mb
 
-    response = _call_control_plane_api(cp_state, "POST", "/labs", payload=payload)
+    if isinstance(host_id, str) and host_id.strip():
+        resolved_host_id = _resolve_control_plane_host_id(state, host_id)
+        payload["host_id"] = resolved_host_id
+        response = _call_control_plane_api(cp_state, "POST", "/labs", payload=payload)
+    else:
+        response = _call_control_plane_api(
+            cp_state,
+            "POST",
+            "/labs/scheduled",
+            payload=payload,
+            query={"scheduling_method": scheduling_method},
+        )
+
     click.echo(json.dumps(response, indent=2))
 
 

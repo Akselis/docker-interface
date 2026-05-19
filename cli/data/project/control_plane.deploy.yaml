@@ -23,6 +23,7 @@
     control_plane_rabbitmq_password: guest
     control_plane_rabbitmq_host_port: 5672
     control_plane_rabbitmq_management_port: 15672
+    control_plane_ports_output_file: ""
 
     control_plane_api_key: change-me
 
@@ -92,6 +93,87 @@
       retries: 20
       delay: 3
 
+    - name: Resolve available control plane API host port
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import socket
+
+        start = int("{{ control_plane_host_port }}")
+        end = start + 200
+
+        selected = start
+        for port in range(start, end + 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("0.0.0.0", port))
+                selected = port
+                break
+            except OSError:
+                continue
+            finally:
+                sock.close()
+
+        print(selected)
+        PY
+      register: control_plane_effective_api_port
+      changed_when: false
+
+    - name: Resolve available RabbitMQ AMQP host port
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import socket
+
+        start = int("{{ control_plane_rabbitmq_host_port }}")
+        end = start + 200
+
+        selected = start
+        for port in range(start, end + 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("0.0.0.0", port))
+                selected = port
+                break
+            except OSError:
+                continue
+            finally:
+                sock.close()
+
+        print(selected)
+        PY
+      register: control_plane_effective_rabbitmq_port
+      changed_when: false
+
+    - name: Resolve available RabbitMQ management host port
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import socket
+
+        start = int("{{ control_plane_rabbitmq_management_port }}")
+        end = start + 200
+
+        selected = start
+        for port in range(start, end + 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("0.0.0.0", port))
+                selected = port
+                break
+            except OSError:
+                continue
+            finally:
+                sock.close()
+
+        print(selected)
+        PY
+      register: control_plane_effective_rabbitmq_management_port
+      changed_when: false
+
+    - name: Set effective control plane and RabbitMQ ports
+      ansible.builtin.set_fact:
+        control_plane_effective_host_port: "{{ (control_plane_effective_api_port.stdout | trim) | int }}"
+        control_plane_effective_rabbitmq_host_port: "{{ (control_plane_effective_rabbitmq_port.stdout | trim) | int }}"
+        control_plane_effective_rabbitmq_management_host_port: "{{ (control_plane_effective_rabbitmq_management_port.stdout | trim) | int }}"
+
     - name: Run RabbitMQ container
       community.docker.docker_container:
         name: "{{ control_plane_rabbitmq_container_name }}"
@@ -104,8 +186,8 @@
           RABBITMQ_DEFAULT_USER: "{{ control_plane_rabbitmq_user }}"
           RABBITMQ_DEFAULT_PASS: "{{ control_plane_rabbitmq_password }}"
         published_ports:
-          - "{{ control_plane_rabbitmq_host_port }}:5672"
-          - "{{ control_plane_rabbitmq_management_port }}:15672"
+          - "{{ control_plane_effective_rabbitmq_host_port }}:5672"
+          - "{{ control_plane_effective_rabbitmq_management_host_port }}:15672"
 
     - name: Pull control plane API image
       ansible.builtin.command: docker pull {{ control_plane_image }}
@@ -135,7 +217,7 @@
         networks:
           - name: "{{ control_plane_network_name }}"
         published_ports:
-          - "{{ control_plane_host_port }}:{{ control_plane_container_port }}"
+          - "{{ control_plane_effective_host_port }}:{{ control_plane_container_port }}"
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
           - "{{ control_plane_providers_dir }}:{{ control_plane_providers_dir }}"
@@ -156,3 +238,16 @@
           DEPLOYMENT_TYPE: "{{ control_plane_deployment_type | default('local') }}"
           DNS_PROVIDER_FILE: "{{ control_plane_dns_records_file }}"
           INGRESS_PROVIDER_FILE: "{{ control_plane_ingress_routes_file }}"
+
+    - name: Persist effective control plane ports to local artifact
+      ansible.builtin.copy:
+        dest: "{{ control_plane_ports_output_file }}"
+        content: >-
+          {{ {
+               'control_plane_port': control_plane_effective_host_port,
+               'rabbitmq_port': control_plane_effective_rabbitmq_host_port,
+               'rabbitmq_management_port': control_plane_effective_rabbitmq_management_host_port
+             } | to_nice_json }}
+        mode: "0644"
+      delegate_to: localhost
+      when: control_plane_ports_output_file is defined and (control_plane_ports_output_file | string | length > 0)

@@ -144,6 +144,13 @@ class CreateLabRequest(BaseModel):
     status: LabStatus = LabStatus.STOPPED
 
 
+class CreateScheduledLabRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    cpu_limit: int | None = Field(default=None, ge=0)
+    memory_limit_mb: int | None = Field(default=None, ge=0)
+    status: LabStatus = LabStatus.STOPPED
+
+
 class NameListRequest(BaseModel):
     names: list[str] = Field(min_length=1)
 

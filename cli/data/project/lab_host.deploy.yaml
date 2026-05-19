@@ -10,6 +10,7 @@
     lab_host_compose_dir: /opt/lab_host/compose
     lab_host_restart_policy: unless-stopped
     lab_host_network_name: bridge
+    lab_host_port_output_file: ""
 
   pre_tasks:
     - name: Ensure lab host API key is provided
@@ -45,6 +46,35 @@
       ansible.builtin.command: docker pull {{ lab_host_image }}
       changed_when: true
 
+    - name: Resolve available lab host TCP port
+      ansible.builtin.shell: |
+        python3 - <<'PY'
+        import socket
+
+        start = int("{{ lab_host_host_port }}")
+        end = start + 200
+
+        selected = start
+        for port in range(start, end + 1):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(("0.0.0.0", port))
+                selected = port
+                break
+            except OSError:
+                continue
+            finally:
+                sock.close()
+
+        print(selected)
+        PY
+      register: lab_host_effective_port
+      changed_when: false
+
+    - name: Set effective lab host port fact
+      ansible.builtin.set_fact:
+        lab_host_effective_host_port: "{{ (lab_host_effective_port.stdout | trim) | int }}"
+
     - name: Run lab host container
       community.docker.docker_container:
         name: "{{ lab_host_container_name }}"
@@ -53,7 +83,7 @@
         restart_policy: "{{ lab_host_restart_policy }}"
         network_mode: "{{ lab_host_network_name }}"
         published_ports:
-          - "{{ lab_host_host_port }}:{{ lab_host_container_port }}"
+          - "{{ lab_host_effective_host_port }}:{{ lab_host_container_port }}"
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
           - "{{ lab_host_compose_dir }}:{{ lab_host_compose_dir }}"
@@ -80,6 +110,18 @@
       delegate_to: localhost
       when: lab_host_id_output_file is defined and (lab_host_id_output_file | string | length > 0)
 
+    - name: Persist effective LAB_HOST_PORT to local artifact
+      ansible.builtin.copy:
+        dest: "{{ lab_host_port_output_file }}"
+        content: "{{ lab_host_effective_host_port | string }}"
+        mode: "0644"
+      delegate_to: localhost
+      when: lab_host_port_output_file is defined and (lab_host_port_output_file | string | length > 0)
+
     - name: Show effective LAB_HOST_ID
       ansible.builtin.debug:
         msg: "LAB_HOST_ID={{ lab_host_effective_id }}"
+
+    - name: Show effective LAB_HOST_PORT
+      ansible.builtin.debug:
+        msg: "LAB_HOST_PORT={{ lab_host_effective_host_port }}"

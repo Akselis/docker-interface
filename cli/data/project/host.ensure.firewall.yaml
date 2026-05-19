@@ -1,0 +1,40 @@
+---
+- hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    firewall_allow_tcp_ports: []
+
+  tasks:
+    - name: Install UFW
+      ansible.builtin.apt:
+        name: ufw
+        state: present
+        update_cache: false
+
+    - name: Allow SSH
+      ansible.builtin.command: ufw allow 22/tcp
+      changed_when: false
+      failed_when: false
+
+    - name: Allow configured TCP ports
+      ansible.builtin.command: "ufw allow {{ item }}/tcp"
+      loop: "{{ firewall_allow_tcp_ports }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Enable UFW
+      ansible.builtin.command: ufw --force enable
+      changed_when: false
+      failed_when: false
+
+    - name: Show UFW status
+      ansible.builtin.command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Print UFW status
+      ansible.builtin.debug:
+        var: ufw_status.stdout

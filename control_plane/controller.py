@@ -6,6 +6,7 @@ from typing import Literal
 
 import httpx
 from controller_helpers import (
+    calculate_host_allocated_resources,
     calculate_lab_allocated_resources,
     call_lab_host,
     enforce_resource_capacity,
@@ -14,6 +15,7 @@ from controller_helpers import (
     extract_status_code,
     fetch_runtime_container,
     is_compose_container,
+    is_host_unbounded,
     parse_memory_limit_to_mb,
     raise_for_lab_host_error,
     remove_runtime_container,
@@ -39,12 +41,13 @@ from models import (
     CallLabHostRequest,
     ComposeDeployRequest,
     CreateLabRequest,
+    CreateScheduledLabRequest,
     DeployEnvironmentRequest,
     EnvironmentNetworkMode,
     NameListRequest,
     RegisterHostRequest,
 )
-from networking.providers import get_dns_provider, get_ingress_provider
+from networking.providers import get_dns_provider
 from rabbitmq_consumer import start_consumer_thread
 from secret_store import build_host_api_key_secret_path, get_secret_store
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -139,6 +142,7 @@ async def _ensure_dns_wildcard_for_host(host: Host) -> None:
 async def _ensure_ingress_route_for_runtime_container(
     *,
     host: Host,
+    api_key: str,
     lab: Lab,
     resource_name: str,
     runtime: dict[str, object],
@@ -157,16 +161,25 @@ async def _ensure_ingress_route_for_runtime_container(
         base_domain=host.base_domain,
     )
 
-    ingress = get_ingress_provider()
-    await ingress.ensure_route(
-        hostname=fqdn,
-        upstream_host=host.ip_address,
-        upstream_port=upstream_port,
-        metadata={
-            "lab_name": lab.name,
-            "host_id": str(host.id),
-            "resource_name": resource_name,
+    result = await call_lab_host(
+        host=host,
+        api_key=api_key,
+        method="PUT",
+        endpoint_path=f"/ingress/routes/{fqdn}",
+        json_body={
+            "upstream_host": host.ip_address,
+            "upstream_port": upstream_port,
+            "service_scheme": "http",
+            "metadata": {
+                "lab_name": lab.name,
+                "host_id": str(host.id),
+                "resource_name": resource_name,
+            },
         },
+    )
+    raise_for_lab_host_error(
+        result,
+        operation=f"upsert ingress route '{fqdn}'",
     )
 
     return fqdn
@@ -186,6 +199,7 @@ def _compose_service_name(container: dict[str, object]) -> str | None:
 async def _delete_ingress_route_if_possible(
     *,
     host: Host,
+    api_key: str,
     lab_name: str,
     resource_name: str,
 ) -> None:
@@ -197,13 +211,27 @@ async def _delete_ingress_route_if_possible(
         lab_name=lab_name,
         base_domain=host.base_domain,
     )
-    ingress = get_ingress_provider()
-    await ingress.delete_route(hostname=fqdn)
+
+    result = await call_lab_host(
+        host=host,
+        api_key=api_key,
+        method="DELETE",
+        endpoint_path=f"/ingress/routes/{fqdn}",
+    )
+    code = extract_status_code(result)
+    if code not in {200, 202, 204, 404}:
+        raise_for_lab_host_error(
+            result,
+            operation=f"delete ingress route '{fqdn}'",
+        )
 
 
 def _lab_load_score(
     lab: Lab, host: Host, cpu_used: float, memory_used_mb: int
 ) -> float:
+    if is_host_unbounded(host):
+        return 0.0
+
     cpu_capacity = (
         float(lab.cpu_limit) if lab.cpu_limit is not None else float(host.cpu_total)
     )
@@ -216,6 +244,43 @@ def _lab_load_score(
     cpu_ratio = (cpu_used / cpu_capacity) if cpu_capacity > 0 else 1.0
     memory_ratio = (memory_used_mb / memory_capacity) if memory_capacity > 0 else 1.0
     return max(cpu_ratio, memory_ratio)
+
+
+def _host_load_score(host: Host, cpu_used: float, memory_used_mb: int) -> float:
+    if is_host_unbounded(host):
+        return 0.0
+
+    cpu_capacity = float(host.cpu_total)
+    memory_capacity = float(host.memory_total_mb)
+
+    cpu_ratio = (cpu_used / cpu_capacity) if cpu_capacity > 0 else 1.0
+    memory_ratio = (memory_used_mb / memory_capacity) if memory_capacity > 0 else 1.0
+    return max(cpu_ratio, memory_ratio)
+
+
+def _effective_limits_for_host(
+    *,
+    host: Host,
+    requested_cpu: float | int | None,
+    requested_memory_mb: int | None,
+    resource_kind: str,
+) -> tuple[float | None, int | None, str | None]:
+    if not is_host_unbounded(host):
+        return (
+            float(requested_cpu) if requested_cpu is not None else None,
+            requested_memory_mb,
+            None,
+        )
+
+    if requested_cpu is None and requested_memory_mb is None:
+        return None, None, None
+
+    message = (
+        f"Host '{host.hostname}' is configured as unbounded "
+        "(cpu_total=0 and memory_total_mb=0); "
+        f"{resource_kind} CPU/memory limits were not applied."
+    )
+    return None, None, message
 
 
 async def _select_target_lab(
@@ -287,6 +352,67 @@ async def _select_target_lab(
 
     selected_lab, selected_host, _, _ = candidates[0]
     return selected_lab, selected_host
+
+
+async def _select_target_host_for_lab(
+    *,
+    scheduling_method: Literal["first_fit", "least_allocated"],
+    requested_cpu: float | None,
+    requested_memory_mb: int | None,
+    session: AsyncSession,
+) -> Host:
+    host_repo = HostRepository(session)
+    lab_repo = LabRepository(session)
+    container_repo = ContainerRepository(session)
+    project_repo = ProjectRepository(session)
+
+    hosts = await host_repo.list_all()
+    candidates: list[tuple[Host, float, int]] = []
+
+    requested_cpu_value = float(requested_cpu or 0)
+    requested_memory_value = int(requested_memory_mb or 0)
+
+    for host in hosts:
+        if host.status != HostStatus.ONLINE:
+            continue
+        if not host.api_key_secret_path:
+            continue
+
+        host_cpu_used, host_memory_used = await calculate_host_allocated_resources(
+            host.id,
+            lab_repo,
+            container_repo,
+            project_repo,
+        )
+
+        if not is_host_unbounded(host):
+            host_cpu_after = host_cpu_used + requested_cpu_value
+            host_memory_after = host_memory_used + requested_memory_value
+            if host_cpu_after > float(host.cpu_total):
+                continue
+            if host_memory_after > int(host.memory_total_mb):
+                continue
+
+        candidates.append((host, host_cpu_used, host_memory_used))
+
+    if not candidates:
+        raise HTTPException(
+            status_code=409,
+            detail="No eligible online host has enough capacity for this lab",
+        )
+
+    if scheduling_method == "least_allocated":
+        candidates.sort(
+            key=lambda item: (
+                _host_load_score(item[0], item[1], item[2]),
+                item[0].id,
+            )
+        )
+    else:
+        candidates.sort(key=lambda item: item[0].id)
+
+    selected_host, _, _ = candidates[0]
+    return selected_host
 
 
 @app.on_event("startup")
@@ -455,36 +581,32 @@ async def get_labs(session: AsyncSession = Depends(get_session)):
     return {"labs": [serialize_lab(lab) for lab in labs]}
 
 
-@app.post("/labs", status_code=status.HTTP_201_CREATED)
-async def create_lab(
-    payload: CreateLabRequest,
-    session: AsyncSession = Depends(get_session),
-):
-    logger.info(
-        "Create lab requested name=%s host_id=%s", payload.name, payload.host_id
-    )
+async def _create_lab_on_host(
+    *,
+    name: str,
+    status_value: LabStatus,
+    host: Host,
+    cpu_limit: int | None,
+    memory_limit_mb: int | None,
+    session: AsyncSession,
+) -> dict[str, object]:
     lab_repo = LabRepository(session)
-    host_repo = HostRepository(session)
     network_repo = NetworkRepository(session)
-
-    existing_lab = await lab_repo.get_by_name(payload.name)
-    if existing_lab is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Lab already exists: {payload.name}",
-        )
-
-    host = await host_repo.get_by_id(payload.host_id)
-    if host is None:
-        raise HTTPException(
-            status_code=404, detail=f"Host not found: {payload.host_id}"
-        )
 
     if not host.api_key_secret_path:
         raise HTTPException(
             status_code=400,
             detail=f"Host '{host.hostname}' has no API key secret reference configured",
         )
+
+    effective_cpu_limit, effective_memory_limit_mb, limit_warning = (
+        _effective_limits_for_host(
+            host=host,
+            requested_cpu=cpu_limit,
+            requested_memory_mb=memory_limit_mb,
+            resource_kind="lab",
+        )
+    )
 
     secret_store = get_secret_store()
     try:
@@ -507,20 +629,18 @@ async def create_lab(
 
     created = await lab_repo.insert(
         Lab(
-            name=payload.name,
-            host_id=payload.host_id,
-            status=payload.status,
-            cpu_limit=payload.cpu_limit,
-            memory_limit_mb=payload.memory_limit_mb,
+            name=name,
+            host_id=host.id,
+            status=status_value,
+            cpu_limit=(
+                int(effective_cpu_limit) if effective_cpu_limit is not None else None
+            ),
+            memory_limit_mb=effective_memory_limit_mb,
         )
     )
 
-    default_internal_network_name = (
-        f"lab-{_safe_slug(payload.name)}-{created.id}-internal"
-    )
-    default_external_network_name = (
-        f"lab-{_safe_slug(payload.name)}-{created.id}-external"
-    )
+    default_internal_network_name = f"lab-{_safe_slug(name)}-{created.id}-internal"
+    default_external_network_name = f"lab-{_safe_slug(name)}-{created.id}-external"
 
     created_network_ids: list[str] = []
 
@@ -537,14 +657,14 @@ async def create_lab(
                 "labels": {
                     "evlab.managed_by": "control-plane",
                     "evlab.lab.id": str(created.id),
-                    "evlab.lab.name": payload.name,
+                    "evlab.lab.name": name,
                     "evlab.network.role": "default-internal",
                 },
             },
         )
         raise_for_lab_host_error(
             internal_result,
-            operation=f"create default internal network for lab '{payload.name}'",
+            operation=f"create default internal network for lab '{name}'",
         )
         internal_network_id, internal_name, internal_driver = (
             _extract_network_from_result(internal_result)
@@ -571,14 +691,14 @@ async def create_lab(
                 "labels": {
                     "evlab.managed_by": "control-plane",
                     "evlab.lab.id": str(created.id),
-                    "evlab.lab.name": payload.name,
+                    "evlab.lab.name": name,
                     "evlab.network.role": "default-external",
                 },
             },
         )
         raise_for_lab_host_error(
             external_result,
-            operation=f"create default external network for lab '{payload.name}'",
+            operation=f"create default external network for lab '{name}'",
         )
         external_network_id, external_name, external_driver = (
             _extract_network_from_result(external_result)
@@ -611,14 +731,144 @@ async def create_lab(
         await lab_repo.delete_by_lab_id(created.id)
         raise
 
+    response: dict[str, object] = {"lab": serialize_lab(created)}
+    if limit_warning:
+        response["limit_warning"] = limit_warning
+
     logger.info(
-        "Lab created name=%s id=%s default_internal_network_id=%s default_external_network_id=%s",
+        "Lab created name=%s id=%s host_id=%s default_internal_network_id=%s default_external_network_id=%s",
         created.name,
         created.id,
+        host.id,
         created.default_internal_network_id,
         created.default_external_network_id,
     )
-    return {"lab": serialize_lab(created)}
+    return response
+
+
+@app.post("/labs", status_code=status.HTTP_201_CREATED)
+async def create_lab(
+    payload: CreateLabRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    logger.info(
+        "Create lab requested name=%s host_id=%s", payload.name, payload.host_id
+    )
+    lab_repo = LabRepository(session)
+    host_repo = HostRepository(session)
+
+    existing_lab = await lab_repo.get_by_name(payload.name)
+    if existing_lab is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Lab already exists: {payload.name}",
+        )
+
+    host = await host_repo.get_by_id(payload.host_id)
+    if host is None:
+        raise HTTPException(
+            status_code=404, detail=f"Host not found: {payload.host_id}"
+        )
+
+    if host.status != HostStatus.ONLINE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Host is not online: {host.hostname}",
+        )
+
+    if not is_host_unbounded(host):
+        container_repo = ContainerRepository(session)
+        project_repo = ProjectRepository(session)
+        host_cpu_used, host_memory_used = await calculate_host_allocated_resources(
+            host.id,
+            lab_repo,
+            container_repo,
+            project_repo,
+        )
+
+        requested_cpu = float(payload.cpu_limit or 0)
+        requested_memory = int(payload.memory_limit_mb or 0)
+
+        host_cpu_after = host_cpu_used + requested_cpu
+        host_memory_after = host_memory_used + requested_memory
+
+        if host_cpu_after > float(host.cpu_total):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": f"Insufficient CPU capacity on host '{host.hostname}' for lab '{payload.name}'",
+                    "host_cpu_total": float(host.cpu_total),
+                    "host_cpu_used": host_cpu_used,
+                    "requested_cpu": requested_cpu,
+                    "resulting_cpu": host_cpu_after,
+                },
+            )
+
+        if host_memory_after > int(host.memory_total_mb):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": f"Insufficient memory capacity on host '{host.hostname}' for lab '{payload.name}'",
+                    "host_memory_total_mb": int(host.memory_total_mb),
+                    "host_memory_used_mb": host_memory_used,
+                    "requested_memory_mb": requested_memory,
+                    "resulting_memory_mb": host_memory_after,
+                },
+            )
+
+    return await _create_lab_on_host(
+        name=payload.name,
+        status_value=payload.status,
+        host=host,
+        cpu_limit=payload.cpu_limit,
+        memory_limit_mb=payload.memory_limit_mb,
+        session=session,
+    )
+
+
+@app.post("/labs/scheduled", status_code=status.HTTP_201_CREATED)
+async def create_lab_scheduled(
+    payload: CreateScheduledLabRequest,
+    scheduling_method: Literal["first_fit", "least_allocated"] = "least_allocated",
+    session: AsyncSession = Depends(get_session),
+):
+    logger.info(
+        "Scheduled lab creation requested name=%s method=%s",
+        payload.name,
+        scheduling_method,
+    )
+    lab_repo = LabRepository(session)
+
+    existing_lab = await lab_repo.get_by_name(payload.name)
+    if existing_lab is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Lab already exists: {payload.name}",
+        )
+
+    selected_host = await _select_target_host_for_lab(
+        scheduling_method=scheduling_method,
+        requested_cpu=float(payload.cpu_limit)
+        if payload.cpu_limit is not None
+        else None,
+        requested_memory_mb=payload.memory_limit_mb,
+        session=session,
+    )
+
+    create_result = await _create_lab_on_host(
+        name=payload.name,
+        status_value=payload.status,
+        host=selected_host,
+        cpu_limit=payload.cpu_limit,
+        memory_limit_mb=payload.memory_limit_mb,
+        session=session,
+    )
+
+    return {
+        "scheduling_method": scheduling_method,
+        "selected_host": serialize_host(selected_host),
+        **create_result,
+    }
 
 
 @app.delete("/labs/{lab_name}")
@@ -666,6 +916,7 @@ async def delete_lab(
                     if isinstance(service_name, str) and service_name:
                         await _delete_ingress_route_if_possible(
                             host=host,
+                            api_key=api_key,
                             lab_name=lab.name,
                             resource_name=service_name,
                         )
@@ -694,6 +945,7 @@ async def delete_lab(
             removed_containers.append(row.name)
             await _delete_ingress_route_if_possible(
                 host=host,
+                api_key=api_key,
                 lab_name=lab.name,
                 resource_name=row.name,
             )
@@ -964,11 +1216,19 @@ async def deploy_lab_environment(
     )
 
     host, api_key = await resolve_lab_host_connection(host_repo, lab)
+    effective_requested_cpu, effective_requested_memory_mb, limit_warning = (
+        _effective_limits_for_host(
+            host=host,
+            requested_cpu=requested_cpu,
+            requested_memory_mb=requested_memory_mb,
+            resource_kind=f"environment '{payload.name}'",
+        )
+    )
     await enforce_resource_capacity(
         lab=lab,
         host=host,
-        requested_cpu=requested_cpu,
-        requested_memory_mb=requested_memory_mb,
+        requested_cpu=effective_requested_cpu,
+        requested_memory_mb=effective_requested_memory_mb,
         existing_cpu=existing_cpu,
         existing_memory_mb=existing_memory_mb,
         resource_kind=f"environment '{payload.name}'",
@@ -980,6 +1240,17 @@ async def deploy_lab_environment(
     lab_host_payload = payload.model_dump(
         exclude={"lifetime_type", "time_to_live_seconds", "network_mode"}
     )
+    resources_obj = lab_host_payload.get("resources")
+    if isinstance(resources_obj, dict):
+        if effective_requested_cpu is None:
+            resources_obj["cpu_count"] = None
+        if effective_requested_memory_mb is None:
+            resources_obj["memory_limit"] = None
+        if all(
+            resources_obj.get(key) is None
+            for key in ("cpu_count", "memory_limit", "process_limit")
+        ):
+            lab_host_payload["resources"] = None
 
     created_private_network: Network | None = None
 
@@ -1120,8 +1391,10 @@ async def deploy_lab_environment(
         runtime_status_obj if isinstance(runtime_status_obj, str) else None
     )
 
-    cpu_limit_value = int(requested_cpu) if requested_cpu is not None else None
-    memory_limit_mb = requested_memory_mb
+    cpu_limit_value = (
+        int(effective_requested_cpu) if effective_requested_cpu is not None else None
+    )
+    memory_limit_mb = effective_requested_memory_mb
 
     if existing is None:
         await container_repo.insert(
@@ -1171,6 +1444,7 @@ async def deploy_lab_environment(
         if isinstance(full_runtime, dict):
             ingress_hostname = await _ensure_ingress_route_for_runtime_container(
                 host=host,
+                api_key=api_key,
                 lab=lab,
                 resource_name=container_name_obj,
                 runtime=full_runtime,
@@ -1183,6 +1457,8 @@ async def deploy_lab_environment(
     response: dict[str, object] = {"lab": serialize_lab(lab), "environment": runtime}
     if ingress_hostname is not None:
         response["ingress_hostname"] = ingress_hostname
+    if limit_warning:
+        response["limit_warning"] = limit_warning
 
     logger.info(
         "Environment deployed lab=%s name=%s container_id=%s ingress_hostname=%s",
@@ -1238,11 +1514,19 @@ async def deploy_lab_project(
         )
 
     host, api_key = await resolve_lab_host_connection(host_repo, lab)
+    effective_requested_cpu, effective_requested_memory_mb, limit_warning = (
+        _effective_limits_for_host(
+            host=host,
+            requested_cpu=requested_cpu,
+            requested_memory_mb=requested_memory_mb,
+            resource_kind=f"project '{payload.project_name}'",
+        )
+    )
     await enforce_resource_capacity(
         lab=lab,
         host=host,
-        requested_cpu=requested_cpu,
-        requested_memory_mb=requested_memory_mb,
+        requested_cpu=effective_requested_cpu,
+        requested_memory_mb=effective_requested_memory_mb,
         existing_cpu=existing_cpu,
         existing_memory_mb=existing_memory_mb,
         resource_kind=f"project '{payload.project_name}'",
@@ -1251,12 +1535,18 @@ async def deploy_lab_project(
         project_repo=project_repo,
     )
 
+    lab_host_payload = payload.model_dump()
+    if effective_requested_cpu is None:
+        lab_host_payload["cpu_limit"] = None
+    if effective_requested_memory_mb is None:
+        lab_host_payload["memory_limit"] = None
+
     result = await call_lab_host(
         host=host,
         api_key=api_key,
         method="POST",
         endpoint_path="/compose/deploy",
-        json_body=payload.model_dump(),
+        json_body=lab_host_payload,
         timeout_seconds=120,
     )
     raise_for_lab_host_error(
@@ -1428,6 +1718,7 @@ async def deploy_lab_project(
 
                 hostname = await _ensure_ingress_route_for_runtime_container(
                     host=host,
+                    api_key=api_key,
                     lab=lab,
                     resource_name=service_name,
                     runtime=full_runtime,
@@ -1445,6 +1736,7 @@ async def deploy_lab_project(
             for service_name in ingress_routes.keys():
                 await _delete_ingress_route_if_possible(
                     host=host,
+                    api_key=api_key,
                     lab_name=lab.name,
                     resource_name=service_name,
                 )
@@ -1468,8 +1760,8 @@ async def deploy_lab_project(
                 exposed_services=exposed_services or None,
                 lifetime_type=payload.lifetime_type,
                 time_to_live_seconds=payload.time_to_live_seconds,
-                cpu_limit=requested_cpu,
-                memory_limit_mb=requested_memory_mb,
+                cpu_limit=effective_requested_cpu,
+                memory_limit_mb=effective_requested_memory_mb,
             )
         )
     else:
@@ -1486,8 +1778,8 @@ async def deploy_lab_project(
         row.exposed_services = exposed_services or None
         row.lifetime_type = payload.lifetime_type
         row.time_to_live_seconds = payload.time_to_live_seconds
-        row.cpu_limit = requested_cpu
-        row.memory_limit_mb = requested_memory_mb
+        row.cpu_limit = effective_requested_cpu
+        row.memory_limit_mb = effective_requested_memory_mb
         await project_repo.update(row)
 
     if lab.status != LabStatus.RUNNING:
@@ -1500,6 +1792,8 @@ async def deploy_lab_project(
     }
     if ingress_routes:
         response["ingress_routes"] = ingress_routes
+    if limit_warning:
+        response["limit_warning"] = limit_warning
 
     logger.info(
         "Project deployed lab=%s project=%s ingress_routes=%s",
@@ -1644,6 +1938,7 @@ async def delete_lab_environments(
         await container_repo.delete_row(row)
         await _delete_ingress_route_if_possible(
             host=host,
+            api_key=api_key,
             lab_name=lab.name,
             resource_name=row.name,
         )
@@ -1719,6 +2014,7 @@ async def delete_lab_environment(
     await container_repo.delete_row(row)
     await _delete_ingress_route_if_possible(
         host=host,
+        api_key=api_key,
         lab_name=lab.name,
         resource_name=container_name,
     )
@@ -1791,6 +2087,7 @@ async def delete_lab_projects(
                 if isinstance(service_name, str) and service_name:
                     await _delete_ingress_route_if_possible(
                         host=host,
+                        api_key=api_key,
                         lab_name=lab.name,
                         resource_name=service_name,
                     )
@@ -1845,6 +2142,7 @@ async def delete_lab_project(
             if isinstance(service_name, str) and service_name:
                 await _delete_ingress_route_if_possible(
                     host=host,
+                    api_key=api_key,
                     lab_name=lab.name,
                     resource_name=service_name,
                 )

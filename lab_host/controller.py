@@ -20,6 +20,8 @@ from models import (
     ComposeLogsArgs,
     ContainerArgs,
     ExecCommandRequest,
+    IngressEnsureArgs,
+    IngressRouteUpsertArgs,
     NetworkConnectArgs,
     NetworkCreateArgs,
     NetworkDisconnectArgs,
@@ -555,3 +557,36 @@ def prune_volumes():
         raise HTTPException(
             status_code=500, detail=f"Docker client error: {str(exc)}"
         ) from exc
+
+
+@app.post("/ingress/ensure")
+def ensure_ingress(payload: IngressEnsureArgs):
+    try:
+        result = di.ensure_ingress_proxy(payload)
+        return {"ingress": result}
+    except APIError as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker API error: {exc.explanation}"
+        ) from exc
+    except DockerException as exc:
+        raise HTTPException(
+            status_code=500, detail=f"Docker client error: {str(exc)}"
+        ) from exc
+
+
+@app.put("/ingress/routes/{hostname}")
+def upsert_ingress_route(hostname: str, payload: IngressRouteUpsertArgs):
+    try:
+        result = di.upsert_ingress_route(hostname, payload)
+        return {"ingress": result}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/ingress/routes/{hostname}")
+def delete_ingress_route(hostname: str):
+    try:
+        result = di.remove_ingress_route(hostname)
+        return {"ingress": result}
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
