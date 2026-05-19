@@ -28,6 +28,9 @@
 
     control_plane_db_url: "postgresql+asyncpg://{{ control_plane_db_user }}:{{ control_plane_db_password }}@{{ control_plane_db_container_name }}:5432/{{ control_plane_db_name }}"
     control_plane_rabbitmq_url: "amqp://{{ control_plane_rabbitmq_user }}:{{ control_plane_rabbitmq_password }}@{{ control_plane_rabbitmq_container_name }}:5672/%2F"
+    control_plane_providers_dir: /opt/control_plane/providers
+    control_plane_dns_records_file: /opt/control_plane/providers/dns_records.json
+    control_plane_ingress_routes_file: /opt/control_plane/providers/ingress_routes.json
 
   pre_tasks:
     - name: Ensure control plane API key is provided
@@ -46,6 +49,12 @@
     - name: Ensure postgres data directory exists
       ansible.builtin.file:
         path: "{{ control_plane_db_volume }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure providers directory exists
+      ansible.builtin.file:
+        path: "{{ control_plane_providers_dir }}"
         state: directory
         mode: "0755"
 
@@ -125,6 +134,7 @@
           - "{{ control_plane_host_port }}:{{ control_plane_container_port }}"
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
+          - "{{ control_plane_providers_dir }}:{{ control_plane_providers_dir }}"
         command:
           - uvicorn
           - controller:app
@@ -139,3 +149,6 @@
           RABBITMQ_EXCHANGE: "{{ control_plane_rabbitmq_exchange | default('lab.events') }}"
           RABBITMQ_QUEUE: "{{ control_plane_rabbitmq_queue | default('control_plane.heartbeats') }}"
           RABBITMQ_ROUTING_KEY_PATTERN: "{{ control_plane_routing_key_pattern | default('heartbeat.*') }}"
+          DEPLOYMENT_TYPE: "{{ control_plane_deployment_type | default('local') }}"
+          DNS_PROVIDER_FILE: "{{ control_plane_dns_records_file }}"
+          INGRESS_PROVIDER_FILE: "{{ control_plane_ingress_routes_file }}"

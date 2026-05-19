@@ -43,5 +43,5 @@ RUN ansible-galaxy collection install community.docker
 
 COPY . .
 
-ENTRYPOINT ["python", "evlab.py"]
+ENTRYPOINT ["/app/cli/scripts/entrypoint.sh"]
 CMD ["--help"]

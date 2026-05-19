@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 from typing import Any
@@ -14,10 +15,23 @@ RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F"
 RABBITMQ_EXCHANGE = os.getenv("RABBITMQ_EXCHANGE", "lab.events")
 RABBITMQ_QUEUE = os.getenv("RABBITMQ_QUEUE", "control_plane.heartbeats")
 RABBITMQ_ROUTING_KEY_PATTERN = os.getenv("RABBITMQ_ROUTING_KEY_PATTERN", "heartbeat.*")
+RECONCILE_INTERVAL_SECONDS = int(os.getenv("RECONCILE_INTERVAL_SECONDS", "45"))
+
+logger = logging.getLogger(__name__)
 
 
 def handle_heartbeat(payload: dict[str, Any]) -> None:
     asyncio.run(reconcile_heartbeat_payload(payload))
+
+
+def _periodic_reconcile_forever() -> None:
+    while True:
+        try:
+            asyncio.run(reconcile_heartbeat_payload({}))
+        except Exception as exc:
+            logger.warning("Periodic reconciliation failed: %s", exc)
+        finally:
+            threading.Event().wait(RECONCILE_INTERVAL_SECONDS)
 
 
 def _consume_forever() -> None:
@@ -46,7 +60,8 @@ def _consume_forever() -> None:
             if isinstance(data, dict):
                 handle_heartbeat(data)
             ch.basic_ack(delivery_tag=method.delivery_tag)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Heartbeat processing failed: %s", exc)
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
 
     channel.basic_qos(prefetch_count=10)
@@ -55,6 +70,13 @@ def _consume_forever() -> None:
 
 
 def start_consumer_thread() -> threading.Thread:
+    periodic = threading.Thread(
+        target=_periodic_reconcile_forever,
+        name="control-plane-periodic-reconcile",
+        daemon=True,
+    )
+    periodic.start()
+
     thread = threading.Thread(
         target=_consume_forever, name="rabbitmq-heartbeat-consumer", daemon=True
     )

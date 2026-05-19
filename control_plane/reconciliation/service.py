@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
+from threading import Lock
 from typing import Any
 
 from controller_helpers import (
@@ -22,6 +24,9 @@ from db.repos.project import ProjectRepository
 from db.session import session_scope
 from networking.providers import get_ingress_provider
 from secret_store import get_secret_store
+
+_RECONCILE_LOCK = Lock()
+logger = logging.getLogger(__name__)
 
 
 def _safe_slug(value: str) -> str:
@@ -121,6 +126,12 @@ async def _remove_container_row_and_runtime(
     container_repo: ContainerRepository,
     container_row: Container,
 ) -> None:
+    logger.info(
+        "Reconciler removing container lab=%s name=%s container_id=%s",
+        lab.name,
+        container_row.name,
+        container_row.container_id,
+    )
     await remove_runtime_container(
         host=host,
         api_key=api_key,
@@ -158,6 +169,11 @@ async def _reconcile_container(
         row.created_at_utc,
         row.time_to_live_seconds,
     ):
+        logger.info(
+            "Reconciler TTL expired for container lab=%s name=%s",
+            lab.name,
+            row.name,
+        )
         await _remove_container_row_and_runtime(
             host=host,
             api_key=api_key,
@@ -179,6 +195,11 @@ async def _reconcile_container(
             )
             return
         if status_value in {"exited", "dead", "stopped"} and exit_code == 0:
+            logger.info(
+                "Reconciler single-use completion for container lab=%s name=%s",
+                lab.name,
+                row.name,
+            )
             await _remove_container_row_and_runtime(
                 host=host,
                 api_key=api_key,
@@ -193,6 +214,9 @@ async def _reconcile_container(
 
     if desired == ContainerStatus.STARTED:
         if status_value not in {"running", "restarting"}:
+            logger.info(
+                "Reconciler starting container lab=%s name=%s", lab.name, row.name
+            )
             await call_lab_host(
                 host=host,
                 api_key=api_key,
@@ -201,6 +225,9 @@ async def _reconcile_container(
             )
     elif desired == ContainerStatus.STOPPED:
         if status_value in {"running", "restarting", "paused"}:
+            logger.info(
+                "Reconciler stopping container lab=%s name=%s", lab.name, row.name
+            )
             await call_lab_host(
                 host=host,
                 api_key=api_key,
@@ -209,6 +236,9 @@ async def _reconcile_container(
             )
     elif desired == ContainerStatus.PAUSED:
         if status_value == "running":
+            logger.info(
+                "Reconciler pausing container lab=%s name=%s", lab.name, row.name
+            )
             await call_lab_host(
                 host=host,
                 api_key=api_key,
@@ -238,6 +268,11 @@ async def _remove_project_row_and_runtime(
     project_repo: ProjectRepository,
     project_row: Project,
 ) -> None:
+    logger.info(
+        "Reconciler removing project lab=%s project=%s",
+        lab.name,
+        project_row.project_name,
+    )
     await call_lab_host(
         host=host,
         api_key=api_key,
@@ -296,6 +331,11 @@ async def _reconcile_project(
         row.created_at_utc,
         row.time_to_live_seconds,
     ):
+        logger.info(
+            "Reconciler TTL expired for project lab=%s project=%s",
+            lab.name,
+            row.project_name,
+        )
         await _remove_project_row_and_runtime(
             host=host,
             api_key=api_key,
@@ -308,6 +348,11 @@ async def _reconcile_project(
     if row.lifetime_type == LifetimeType.SINGLE_USE and _all_single_use_success(
         containers
     ):
+        logger.info(
+            "Reconciler single-use completion for project lab=%s project=%s",
+            lab.name,
+            row.project_name,
+        )
         await _remove_project_row_and_runtime(
             host=host,
             api_key=api_key,
@@ -328,6 +373,11 @@ async def _reconcile_project(
             should_up = not running_exists
 
         if should_up:
+            logger.info(
+                "Reconciler bringing project up lab=%s project=%s",
+                lab.name,
+                row.project_name,
+            )
             await call_lab_host(
                 host=host,
                 api_key=api_key,
@@ -338,6 +388,11 @@ async def _reconcile_project(
 
     elif row.desired_state == ProjectDesiredState.STOPPED:
         if ps_code < 400 and containers:
+            logger.info(
+                "Reconciler bringing project down lab=%s project=%s",
+                lab.name,
+                row.project_name,
+            )
             await call_lab_host(
                 host=host,
                 api_key=api_key,
@@ -347,53 +402,87 @@ async def _reconcile_project(
             )
 
 
+async def _reconcile_for_host(
+    *,
+    host: Host,
+    lab_repo: LabRepository,
+    container_repo: ContainerRepository,
+    project_repo: ProjectRepository,
+    runtime_by_id: dict[str, dict[str, object]],
+) -> None:
+    api_key = await _resolve_host_api_key(host)
+    if not api_key:
+        return
+
+    labs = await lab_repo.list_by_host_id(host.id)
+
+    for lab in labs:
+        container_rows = await container_repo.list_by_lab_id(lab.id)
+        for row in container_rows:
+            await _reconcile_container(
+                host=host,
+                api_key=api_key,
+                lab=lab,
+                container_repo=container_repo,
+                row=row,
+                runtime_by_id=runtime_by_id,
+            )
+
+        project_rows = await project_repo.list_by_lab_id(lab.id)
+        for row in project_rows:
+            await _reconcile_project(
+                host=host,
+                api_key=api_key,
+                lab=lab,
+                project_repo=project_repo,
+                row=row,
+            )
+
+
 async def reconcile_heartbeat_payload(payload: dict[str, Any]) -> None:
-    async with session_scope() as session:
-        host_repo = HostRepository(session)
-        lab_repo = LabRepository(session)
-        container_repo = ContainerRepository(session)
-        project_repo = ProjectRepository(session)
+    if not _RECONCILE_LOCK.acquire(blocking=False):
+        logger.debug("Reconciliation skipped: lock already held")
+        return
 
-        host = await host_repo.resolve_from_heartbeat_payload(payload)
-        if host is None:
-            return
+    try:
+        async with session_scope() as session:
+            host_repo = HostRepository(session)
+            lab_repo = LabRepository(session)
+            container_repo = ContainerRepository(session)
+            project_repo = ProjectRepository(session)
 
-        host = await host_repo.mark_online(host)
+            runtime_by_id: dict[str, dict[str, object]] = {}
+            containers_obj = payload.get("containers")
+            if isinstance(containers_obj, list):
+                for item in containers_obj:
+                    if not isinstance(item, dict):
+                        continue
+                    cid = item.get("id")
+                    if isinstance(cid, str) and cid:
+                        runtime_by_id[cid] = item
 
-        api_key = await _resolve_host_api_key(host)
-        if not api_key:
-            return
-
-        containers_obj = payload.get("containers")
-        runtime_by_id: dict[str, dict[str, object]] = {}
-        if isinstance(containers_obj, list):
-            for item in containers_obj:
-                if not isinstance(item, dict):
-                    continue
-                cid = item.get("id")
-                if isinstance(cid, str) and cid:
-                    runtime_by_id[cid] = item
-
-        labs = await lab_repo.list_by_host_id(host.id)
-
-        for lab in labs:
-            container_rows = await container_repo.list_by_lab_id(lab.id)
-            for row in container_rows:
-                await _reconcile_container(
+            host = await host_repo.resolve_from_heartbeat_payload(payload)
+            if host is not None:
+                host = await host_repo.mark_online(host)
+                logger.info("Reconciler processing heartbeat host=%s", host.hostname)
+                await _reconcile_for_host(
                     host=host,
-                    api_key=api_key,
-                    lab=lab,
+                    lab_repo=lab_repo,
                     container_repo=container_repo,
-                    row=row,
+                    project_repo=project_repo,
                     runtime_by_id=runtime_by_id,
                 )
+                return
 
-            project_rows = await project_repo.list_by_lab_id(lab.id)
-            for row in project_rows:
-                await _reconcile_project(
-                    host=host,
-                    api_key=api_key,
-                    lab=lab,
+            hosts = await host_repo.list_all()
+            logger.info("Reconciler periodic run hosts=%s", len(hosts))
+            for row in hosts:
+                await _reconcile_for_host(
+                    host=row,
+                    lab_repo=lab_repo,
+                    container_repo=container_repo,
                     project_repo=project_repo,
-                    row=row,
+                    runtime_by_id={},
                 )
+    finally:
+        _RECONCILE_LOCK.release()

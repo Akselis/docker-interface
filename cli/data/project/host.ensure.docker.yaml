@@ -29,6 +29,31 @@
       changed_when: false
       failed_when: false
 
+    - name: Check whether Docker daemon is reachable
+      ansible.builtin.command: docker info
+      register: docker_daemon_check
+      changed_when: false
+      failed_when: false
+
+    - name: Detect containerized local execution
+      ansible.builtin.set_fact:
+        manage_docker_service: >-
+          {{
+            not (
+              (ansible_connection | default('')) == 'local'
+              and (ansible_virtualization_type | default('')) in ['docker', 'containerd', 'podman']
+            )
+          }}
+
+    - name: Ensure docker daemon is reachable in containerized local execution
+      ansible.builtin.assert:
+        that:
+          - docker_daemon_check.rc == 0
+        fail_msg: >-
+          Docker daemon is not reachable from this environment.
+          If running CLI in a container, mount /var/run/docker.sock and retry.
+      when: not manage_docker_service
+
     - name: Install Docker engine from distro packages when missing
       ansible.builtin.apt:
         name:
@@ -36,10 +61,14 @@
           - python3-docker
         state: present
         update_cache: "{{ apt_update_cache }}"
-      when: docker_cli_check.rc != 0
+      when:
+        - manage_docker_service
+        - docker_cli_check.rc != 0
 
     - name: Install Docker Compose plugin when missing
-      when: docker_compose_check.rc != 0
+      when:
+        - manage_docker_service
+        - docker_compose_check.rc != 0
       block:
         - name: Install docker-compose-plugin
           ansible.builtin.apt:
@@ -66,6 +95,7 @@
         name: docker
         enabled: true
         state: started
+      when: manage_docker_service
 
     - name: Add users to docker group
       ansible.builtin.user:
@@ -93,3 +123,14 @@
     - name: Print docker compose version
       ansible.builtin.debug:
         var: docker_compose_version.stdout
+
+    - name: Validate docker daemon reachability
+      ansible.builtin.command: docker info
+      register: docker_info_verify
+      changed_when: false
+      failed_when: docker_info_verify.rc != 0
+
+    - name: Print docker server info summary
+      ansible.builtin.debug:
+        msg: "Docker daemon reachable on {{ target_host }}"
+      when: docker_info_verify.rc == 0

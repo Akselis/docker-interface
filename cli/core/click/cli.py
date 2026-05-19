@@ -622,6 +622,13 @@ def bootstrap_control_plane(
     if not ok:
         raise click.ClickException(f"Docker setup failed: {msg}")
 
+    provision = state.data.get("provision") if isinstance(state.data, dict) else {}
+    provision_type = (
+        provision.get("type")
+        if isinstance(provision, dict) and isinstance(provision.get("type"), str)
+        else "local"
+    )
+
     deploy_vars = {
         **common_extravars,
         "control_plane_image": CONTROL_PLANE_DEFAULT_IMAGE,
@@ -631,6 +638,7 @@ def bootstrap_control_plane(
         "control_plane_db_password": control_plane_db_password,
         "control_plane_rabbitmq_user": rabbitmq_user,
         "control_plane_rabbitmq_password": rabbitmq_password,
+        "control_plane_deployment_type": provision_type,
     }
 
     ok, msg = run_playbook("control_plane.deploy.yaml", deploy_vars)
@@ -932,7 +940,13 @@ def control_plane_env_get(lab_name: str, container_name: str) -> None:
 
 
 @control_plane_env.command("deploy")
-@click.option("--lab", "lab_name", required=True)
+@click.option("--lab", "lab_name", required=False, default=None)
+@click.option(
+    "--scheduling-method",
+    default="least_allocated",
+    show_default=True,
+    type=click.Choice(["first_fit", "least_allocated"]),
+)
 @click.option("--image", required=True)
 @click.option("--name", "container_name", required=True)
 @click.option(
@@ -958,7 +972,8 @@ def control_plane_env_get(lab_name: str, container_name: str) -> None:
     "--json-file", default=None, help="JSON file with additional payload fields"
 )
 def control_plane_env_deploy(
-    lab_name: str,
+    lab_name: str | None,
+    scheduling_method: str,
     image: str,
     container_name: str,
     network_mode: str,
@@ -977,12 +992,21 @@ def control_plane_env_deploy(
     if extra:
         payload.update(extra)
 
-    response = _call_control_plane_api(
-        cp_state,
-        "POST",
-        f"/lab/{lab_name}/environments",
-        payload=payload,
-    )
+    if isinstance(lab_name, str) and lab_name:
+        response = _call_control_plane_api(
+            cp_state,
+            "POST",
+            f"/lab/{lab_name}/environments",
+            payload=payload,
+        )
+    else:
+        response = _call_control_plane_api(
+            cp_state,
+            "POST",
+            "/environments/scheduled",
+            payload=payload,
+            query={"scheduling_method": scheduling_method},
+        )
     click.echo(json.dumps(response, indent=2))
 
 
@@ -1064,11 +1088,18 @@ def control_plane_projects_get(lab_name: str, project_name: str) -> None:
 
 
 @control_plane_projects.command("deploy")
-@click.option("--lab", "lab_name", required=True)
+@click.option("--lab", "lab_name", required=False, default=None)
+@click.option(
+    "--scheduling-method",
+    default="least_allocated",
+    show_default=True,
+    type=click.Choice(["first_fit", "least_allocated"]),
+)
 @click.option("--json", "json_str", default=None, help="Inline JSON object payload")
 @click.option("--json-file", default=None, help="Path to JSON object payload file")
 def control_plane_projects_deploy(
-    lab_name: str,
+    lab_name: str | None,
+    scheduling_method: str,
     json_str: str | None,
     json_file: str | None,
 ) -> None:
@@ -1080,12 +1111,21 @@ def control_plane_projects_deploy(
             "Project deploy requires --json or --json-file payload"
         )
 
-    response = _call_control_plane_api(
-        cp_state,
-        "POST",
-        f"/lab/{lab_name}/projects",
-        payload=payload,
-    )
+    if isinstance(lab_name, str) and lab_name:
+        response = _call_control_plane_api(
+            cp_state,
+            "POST",
+            f"/lab/{lab_name}/projects",
+            payload=payload,
+        )
+    else:
+        response = _call_control_plane_api(
+            cp_state,
+            "POST",
+            "/projects/scheduled",
+            payload=payload,
+            query={"scheduling_method": scheduling_method},
+        )
     click.echo(json.dumps(response, indent=2))
 
 

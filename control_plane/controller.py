@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Literal
 
@@ -47,6 +48,8 @@ from networking.providers import get_dns_provider, get_ingress_provider
 from rabbitmq_consumer import start_consumer_thread
 from secret_store import build_host_api_key_secret_path, get_secret_store
 from sqlalchemy.ext.asyncio import AsyncSession
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -288,6 +291,7 @@ async def _select_target_lab(
 
 @app.on_event("startup")
 def startup_event() -> None:
+    logger.info("Starting control-plane heartbeat consumer thread")
     start_consumer_thread()
 
 
@@ -296,6 +300,12 @@ async def register_host(
     payload: RegisterHostRequest,
     session: AsyncSession = Depends(get_session),
 ):
+    logger.info(
+        "Host registration requested hostname=%s ip=%s port=%s",
+        payload.hostname,
+        payload.ip_address,
+        payload.port,
+    )
     client = LabHostClient()
 
     try:
@@ -368,6 +378,7 @@ async def register_host(
             )
         )
         await _ensure_dns_wildcard_for_host(host)
+        logger.info("Host registered hostname=%s id=%s", host.hostname, host.id)
         return {"status": "registered", "host": serialize_host(host)}
 
     existing.hostname = payload.hostname
@@ -384,6 +395,7 @@ async def register_host(
     existing.last_heartbeat_utc = now
     host = await host_repo.update(existing)
     await _ensure_dns_wildcard_for_host(host)
+    logger.info("Host updated hostname=%s id=%s", host.hostname, host.id)
     return {"status": "updated", "host": serialize_host(host)}
 
 
@@ -448,6 +460,9 @@ async def create_lab(
     payload: CreateLabRequest,
     session: AsyncSession = Depends(get_session),
 ):
+    logger.info(
+        "Create lab requested name=%s host_id=%s", payload.name, payload.host_id
+    )
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
     network_repo = NetworkRepository(session)
@@ -596,6 +611,13 @@ async def create_lab(
         await lab_repo.delete_by_lab_id(created.id)
         raise
 
+    logger.info(
+        "Lab created name=%s id=%s default_internal_network_id=%s default_external_network_id=%s",
+        created.name,
+        created.id,
+        created.default_internal_network_id,
+        created.default_external_network_id,
+    )
     return {"lab": serialize_lab(created)}
 
 
@@ -900,6 +922,13 @@ async def deploy_lab_environment(
     payload: DeployEnvironmentRequest,
     session: AsyncSession = Depends(get_session),
 ):
+    logger.info(
+        "Deploy environment requested lab=%s name=%s image=%s network_mode=%s",
+        lab_name,
+        payload.name,
+        payload.image,
+        payload.network_mode.value,
+    )
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
     container_repo = ContainerRepository(session)
@@ -1154,6 +1183,14 @@ async def deploy_lab_environment(
     response: dict[str, object] = {"lab": serialize_lab(lab), "environment": runtime}
     if ingress_hostname is not None:
         response["ingress_hostname"] = ingress_hostname
+
+    logger.info(
+        "Environment deployed lab=%s name=%s container_id=%s ingress_hostname=%s",
+        lab.name,
+        container_name_obj,
+        container_id_obj,
+        ingress_hostname,
+    )
     return response
 
 
@@ -1163,6 +1200,12 @@ async def deploy_lab_project(
     payload: ComposeDeployRequest,
     session: AsyncSession = Depends(get_session),
 ):
+    logger.info(
+        "Deploy project requested lab=%s project=%s network_mode=%s",
+        lab_name,
+        payload.project_name,
+        payload.network_mode.value,
+    )
     lab_repo = LabRepository(session)
     host_repo = HostRepository(session)
     project_repo = ProjectRepository(session)
@@ -1308,50 +1351,104 @@ async def deploy_lab_project(
         if isinstance(item, str) and item.strip()
     ]
 
+    available_services = {
+        service_name
+        for service_name in (
+            _compose_service_name(item)
+            for item in project_containers
+            if isinstance(item, dict)
+        )
+        if isinstance(service_name, str) and service_name
+    }
+
+    unknown_exposed = sorted(
+        service_name
+        for service_name in exposed_services
+        if service_name not in available_services
+    )
+    if unknown_exposed:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "exposed_services contains services not present in deployed project",
+                "unknown_services": unknown_exposed,
+            },
+        )
+
+    if host.base_domain and exposed_services:
+        fqdn_candidates = [
+            _route_hostname(
+                resource_name=service_name,
+                lab_name=lab.name,
+                base_domain=host.base_domain,
+            )
+            for service_name in exposed_services
+        ]
+        if len(set(fqdn_candidates)) != len(fqdn_candidates):
+            raise HTTPException(
+                status_code=409,
+                detail="exposed_services produce duplicate ingress hostnames",
+            )
+
     ingress_routes: dict[str, str] = {}
     if network_mode in {
         ProjectNetworkMode.EXTERNAL_PRIVATE,
         ProjectNetworkMode.EXTERNAL_EXPOSED,
     }:
         routed_services: set[str] = set()
-        for container in project_containers:
-            if not isinstance(container, dict):
-                continue
-            service_name = _compose_service_name(container)
-            if not isinstance(service_name, str) or service_name in routed_services:
-                continue
-            if service_name not in exposed_services:
-                continue
+        try:
+            for container in project_containers:
+                if not isinstance(container, dict):
+                    continue
+                service_name = _compose_service_name(container)
+                if not isinstance(service_name, str) or service_name in routed_services:
+                    continue
+                if service_name not in exposed_services:
+                    continue
 
-            container_id = container.get("id")
-            if not isinstance(container_id, str) or not container_id:
-                continue
+                container_id = container.get("id")
+                if not isinstance(container_id, str) or not container_id:
+                    continue
 
-            full_runtime_result = await call_lab_host(
-                host=host,
-                api_key=api_key,
-                method="GET",
-                endpoint_path=f"/containers/{container_id}",
-                query={"full": "true"},
-            )
-            raise_for_lab_host_error(
-                full_runtime_result,
-                operation=f"get runtime container '{container_id}'",
-            )
-            full_runtime_body = extract_body(full_runtime_result)
-            full_runtime = extract_container_from_body(full_runtime_body)
-            if not isinstance(full_runtime, dict):
-                continue
+                full_runtime_result = await call_lab_host(
+                    host=host,
+                    api_key=api_key,
+                    method="GET",
+                    endpoint_path=f"/containers/{container_id}",
+                    query={"full": "true"},
+                )
+                raise_for_lab_host_error(
+                    full_runtime_result,
+                    operation=f"get runtime container '{container_id}'",
+                )
+                full_runtime_body = extract_body(full_runtime_result)
+                full_runtime = extract_container_from_body(full_runtime_body)
+                if not isinstance(full_runtime, dict):
+                    continue
 
-            hostname = await _ensure_ingress_route_for_runtime_container(
-                host=host,
-                lab=lab,
-                resource_name=service_name,
-                runtime=full_runtime,
-            )
-            if hostname is not None:
+                hostname = await _ensure_ingress_route_for_runtime_container(
+                    host=host,
+                    lab=lab,
+                    resource_name=service_name,
+                    runtime=full_runtime,
+                )
+                if hostname is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Service '{service_name}' has no published TCP host port for ingress routing"
+                        ),
+                    )
                 ingress_routes[service_name] = hostname
-            routed_services.add(service_name)
+                routed_services.add(service_name)
+        except Exception:
+            for service_name in ingress_routes.keys():
+                await _delete_ingress_route_if_possible(
+                    host=host,
+                    lab_name=lab.name,
+                    resource_name=service_name,
+                )
+            raise
 
     if row is None:
         await project_repo.insert(
@@ -1403,6 +1500,13 @@ async def deploy_lab_project(
     }
     if ingress_routes:
         response["ingress_routes"] = ingress_routes
+
+    logger.info(
+        "Project deployed lab=%s project=%s ingress_routes=%s",
+        lab.name,
+        payload.project_name,
+        len(ingress_routes),
+    )
     return response
 
 
@@ -1430,6 +1534,11 @@ async def deploy_environment_scheduled(
         requested_memory_mb=requested_memory_mb,
         session=session,
     )
+    logger.info(
+        "Scheduled environment deployment selected lab=%s method=%s",
+        selected_lab.name,
+        scheduling_method,
+    )
 
     deploy_result = await deploy_lab_environment(
         lab_name=selected_lab.name,
@@ -1449,6 +1558,11 @@ async def deploy_project_scheduled(
     scheduling_method: Literal["first_fit", "least_allocated"] = "least_allocated",
     session: AsyncSession = Depends(get_session),
 ):
+    logger.info(
+        "Scheduled project deployment requested project=%s method=%s",
+        payload.project_name,
+        scheduling_method,
+    )
     requested_cpu = float(payload.cpu_limit) if payload.cpu_limit is not None else None
     try:
         requested_memory_mb = parse_memory_limit_to_mb(payload.memory_limit)
@@ -1460,6 +1574,11 @@ async def deploy_project_scheduled(
         requested_cpu=requested_cpu,
         requested_memory_mb=requested_memory_mb,
         session=session,
+    )
+    logger.info(
+        "Scheduled project deployment selected lab=%s method=%s",
+        selected_lab.name,
+        scheduling_method,
     )
 
     deploy_result = await deploy_lab_project(

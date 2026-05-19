@@ -22,3 +22,9 @@ docker run -d \
 curl -X GET "http://localhost:8000/containers" \
   -H "X-API-Key: replace-with-strong-key"
 ```
+
+## Bachelor submission checklist
+
+For the minimal must-have validation scope and demo runbook, see:
+
+- `docs/pre_submission_checklist.md`
