@@ -1471,6 +1471,80 @@ def control_plane_env_deploy(
     click.echo(json.dumps(response, indent=2))
 
 
+@control_plane_env.command("update")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--name", "container_name", required=True)
+@click.option(
+    "--image",
+    default=None,
+    help="Override image; if omitted, use current runtime image",
+)
+@click.option(
+    "--network-mode",
+    required=True,
+    type=click.Choice(
+        [
+            "offline",
+            "internal_private",
+            "internal_exposed",
+            "external_private",
+            "external_exposed",
+        ]
+    ),
+)
+@click.option(
+    "--json",
+    "json_str",
+    default=None,
+    help="Additional JSON object to merge into payload",
+)
+@click.option(
+    "--json-file", default=None, help="JSON file with additional payload fields"
+)
+def control_plane_env_update(
+    lab_name: str,
+    container_name: str,
+    image: str | None,
+    network_mode: str,
+    json_str: str | None,
+    json_file: str | None,
+) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+
+    resolved_image = image
+    if not isinstance(resolved_image, str) or not resolved_image.strip():
+        current = _call_control_plane_api(
+            cp_state,
+            "GET",
+            f"/lab/{lab_name}/environments/{container_name}",
+        )
+        env_obj = current.get("environment") if isinstance(current, dict) else None
+        current_image = env_obj.get("image") if isinstance(env_obj, dict) else None
+        if not isinstance(current_image, str) or not current_image:
+            raise click.ClickException(
+                "Could not determine current image for environment update. Pass --image explicitly."
+            )
+        resolved_image = current_image
+
+    payload: dict[str, Any] = {
+        "image": resolved_image,
+        "name": container_name,
+        "network_mode": network_mode,
+    }
+    extra = _load_json_from_args(json_str, json_file)
+    if extra:
+        payload.update(extra)
+
+    response = _call_control_plane_api(
+        cp_state,
+        "POST",
+        f"/lab/{lab_name}/environments",
+        payload=payload,
+    )
+    click.echo(json.dumps(response, indent=2))
+
+
 @control_plane_env.command("delete")
 @click.option("--lab", "lab_name", required=True)
 @click.option("--name", "container_name", required=True)
@@ -1587,6 +1661,57 @@ def control_plane_projects_deploy(
             payload=payload,
             query={"scheduling_method": scheduling_method},
         )
+    click.echo(json.dumps(response, indent=2))
+
+
+@control_plane_projects.command("update")
+@click.option("--lab", "lab_name", required=True)
+@click.option("--name", "project_name", required=True)
+@click.option(
+    "--network-mode",
+    default=None,
+    type=click.Choice(
+        [
+            "internal_private",
+            "internal_exposed",
+            "external_private",
+            "external_exposed",
+        ]
+    ),
+)
+@click.option(
+    "--json",
+    "json_str",
+    default=None,
+    help="Project payload as JSON object. Required for reliable updates.",
+)
+@click.option("--json-file", default=None, help="Path to project JSON payload file")
+def control_plane_projects_update(
+    lab_name: str,
+    project_name: str,
+    network_mode: str | None,
+    json_str: str | None,
+    json_file: str | None,
+) -> None:
+    state = InfraState()
+    cp_state = _control_plane_state_or_fail(state)
+
+    payload = _load_json_from_args(json_str, json_file)
+    if payload is None:
+        raise click.ClickException(
+            "Project update requires --json or --json-file with full deploy payload"
+        )
+
+    payload["project_name"] = project_name
+    if isinstance(network_mode, str) and network_mode:
+        payload["network_mode"] = network_mode
+
+    response = _call_control_plane_api(
+        cp_state,
+        "POST",
+        f"/lab/{lab_name}/projects",
+        payload=payload,
+    )
     click.echo(json.dumps(response, indent=2))
 
 

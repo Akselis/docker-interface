@@ -31,7 +31,7 @@ class Lab(Base):
     status: Mapped[LabStatus] = mapped_column(
         SAEnum(LabStatus, name="lab_status_enum"),
         nullable=False,
-        default=LabStatus.STOPPED,
+        default=LabStatus.RUNNING,
     )
     default_internal_network_id: Mapped[int | None] = mapped_column(
         ForeignKey("networks.id", ondelete="SET NULL"),

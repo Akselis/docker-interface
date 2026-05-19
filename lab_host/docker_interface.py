@@ -1019,8 +1019,7 @@ def _render_ingress_dynamic_config(routes: dict[str, dict[str, Any]]) -> str:
     lines: list[str] = ["http:", "  routers:"]
 
     if not routes:
-        lines.extend(["    {}", "  services:", "    {}"])
-        return "\n".join(lines) + "\n"
+        return "http:\n  routers: {}\n  services: {}\n"
 
     for hostname in sorted(routes.keys()):
         route = routes[hostname]

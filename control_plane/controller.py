@@ -1239,6 +1239,41 @@ async def deploy_lab_environment(
         project_repo=ProjectRepository(session),
     )
 
+    if existing_by_name is not None:
+        operation_result = await remove_runtime_container(
+            host=host,
+            api_key=api_key,
+            container_ref=existing_by_name.container_id,
+        )
+        delete_status = extract_status_code(operation_result["delete"])
+        if delete_status >= 400 and delete_status != 404:
+            raise_for_lab_host_error(
+                operation_result["delete"],
+                operation=f"replace environment '{payload.name}'",
+            )
+
+        await _delete_ingress_route_if_possible(
+            host=host,
+            api_key=api_key,
+            lab_name=lab.name,
+            resource_name=existing_by_name.name,
+        )
+
+        old_private_network_name = f"lab-{_safe_slug(lab.name)}-{lab.id}-env-{_safe_slug(existing_by_name.name)}"
+        old_private_network = await network_repo.get_by_name(
+            lab.id, old_private_network_name
+        )
+        if old_private_network is not None:
+            network_result = await call_lab_host(
+                host=host,
+                api_key=api_key,
+                method="DELETE",
+                endpoint_path=f"/networks/{old_private_network.network_id}",
+            )
+            network_status = extract_status_code(network_result)
+            if network_status < 400 or network_status == 404:
+                await network_repo.delete_row(old_private_network)
+
     lab_host_payload = payload.model_dump(
         exclude={"lifetime_type", "time_to_live_seconds", "network_mode"}
     )
@@ -1398,7 +1433,9 @@ async def deploy_lab_environment(
     )
     memory_limit_mb = effective_requested_memory_mb
 
-    if existing is None:
+    target_row = existing if existing is not None else existing_by_name
+
+    if target_row is None:
         await container_repo.insert(
             Container(
                 container_id=container_id_obj,
@@ -1414,16 +1451,25 @@ async def deploy_lab_environment(
             )
         )
     else:
-        existing.name = container_name_obj
-        existing.image = image_obj
-        existing.lab_id = lab.id
-        existing.status = mapped_status
-        existing.cpu_limit = cpu_limit_value
-        existing.memory_limit_mb = memory_limit_mb
-        existing.lifetime_type = payload.lifetime_type
-        existing.time_to_live_seconds = payload.time_to_live_seconds
-        existing.last_seen_utc = now
-        await container_repo.update(existing)
+        target_row.container_id = container_id_obj
+        target_row.name = container_name_obj
+        target_row.image = image_obj
+        target_row.lab_id = lab.id
+        target_row.status = mapped_status
+        target_row.cpu_limit = cpu_limit_value
+        target_row.memory_limit_mb = memory_limit_mb
+        target_row.lifetime_type = payload.lifetime_type
+        target_row.time_to_live_seconds = payload.time_to_live_seconds
+        target_row.last_seen_utc = now
+        updated_row = await container_repo.update(target_row)
+
+        if (
+            existing_by_name is not None
+            and existing is not None
+            and existing_by_name.id != existing.id
+            and existing_by_name.id != updated_row.id
+        ):
+            await container_repo.delete_row(existing_by_name)
 
     ingress_hostname: str | None = None
     if payload.network_mode in {
