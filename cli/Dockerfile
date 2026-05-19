@@ -42,6 +42,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN ansible-galaxy collection install community.docker
 
 COPY . .
+RUN chmod +x /app/cli/scripts/entrypoint.sh \
+    && sed -i 's/\r$//' /app/cli/scripts/entrypoint.sh
 
 ENTRYPOINT ["/app/cli/scripts/entrypoint.sh"]
 CMD ["--help"]
