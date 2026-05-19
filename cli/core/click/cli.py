@@ -188,6 +188,41 @@ def _collect_context_hosts(state: InfraState) -> set[str]:
     return hosts
 
 
+def _inventory_devices_snapshot() -> list[dict[str, str]]:
+    inventory = inv.EvLabInventory()
+    data = inventory.yaml.data if isinstance(inventory.yaml.data, dict) else {}
+
+    devices: list[dict[str, str]] = []
+    for group_name, group_obj in data.items():
+        if not isinstance(group_name, str) or not isinstance(group_obj, dict):
+            continue
+
+        hosts_obj = group_obj.get("hosts")
+        if not isinstance(hosts_obj, dict):
+            continue
+
+        for host_name, host_vars_obj in hosts_obj.items():
+            if not isinstance(host_name, str):
+                continue
+
+            host_vars = host_vars_obj if isinstance(host_vars_obj, dict) else {}
+            ansible_host_obj = host_vars.get("ansible_host")
+            ansible_host = (
+                ansible_host_obj if isinstance(ansible_host_obj, str) else host_name
+            )
+
+            devices.append(
+                {
+                    "group": group_name,
+                    "name": host_name,
+                    "ansible_host": ansible_host,
+                }
+            )
+
+    devices.sort(key=lambda item: (item["group"], item["name"]))
+    return devices
+
+
 def _remove_hosts_from_inventory(hosts_to_remove: set[str]) -> None:
     if not hosts_to_remove:
         return
@@ -520,7 +555,9 @@ def infra_status() -> None:
         tf_state["last_output"] = tf_output
         state.set_terraform(tf_state)
 
-    click.echo(json.dumps(state.data, indent=2))
+    payload = dict(state.data)
+    payload["devices"] = _inventory_devices_snapshot()
+    click.echo(json.dumps(payload, indent=2))
 
 
 @infra.command("destroy")
