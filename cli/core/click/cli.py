@@ -16,6 +16,7 @@ from core.infra.state import InfraState
 
 CONTROL_PLANE_DEFAULT_IMAGE = "ghcr.io/akselis/control-plane:latest"
 LAB_HOST_DEFAULT_IMAGE = "ghcr.io/akselis/lab-host:latest"
+CONTROL_PLANE_CONTAINER_NAME = "control-plane-api"
 
 
 def _is_ip(value: str) -> bool:
@@ -24,6 +25,47 @@ def _is_ip(value: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _is_loopback_host(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered == "localhost":
+        return True
+
+    try:
+        return ipaddress.ip_address(lowered).is_loopback
+    except ValueError:
+        return False
+
+
+def _detect_control_plane_gateway_ip(
+    container_name: str = CONTROL_PLANE_CONTAINER_NAME,
+) -> str | None:
+    inspect_cmd = [
+        "docker",
+        "inspect",
+        container_name,
+        "--format",
+        "{{range $name, $network := .NetworkSettings.Networks}}{{if $network.Gateway}}{{$network.Gateway}} {{end}}{{end}}",
+    ]
+    try:
+        result = subprocess.run(
+            inspect_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    for token in result.stdout.split():
+        if _is_ip(token) and not _is_loopback_host(token):
+            return token
+
+    return None
 
 
 def _iter_group_hosts(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -764,6 +806,23 @@ def bootstrap_lab_host(
 
     ansible_host = str(host_vars.get("ansible_host") or target_host)
     register_host_value = register_ip or ansible_host
+
+    if register_ip is None and _is_loopback_host(register_host_value):
+        detected_register_ip = _detect_control_plane_gateway_ip()
+        if isinstance(detected_register_ip, str) and detected_register_ip:
+            register_host_value = detected_register_ip
+            click.secho(
+                "Auto-detected --register-ip from control-plane network gateway: "
+                f"{register_host_value}",
+                fg="yellow",
+            )
+        else:
+            click.secho(
+                "Could not auto-detect non-loopback register IP. "
+                "Control-plane may not reach 127.0.0.1 from inside its container. "
+                "Pass --register-ip explicitly.",
+                fg="yellow",
+            )
 
     effective_lab_host_id = register_host_name
     if os.path.exists(id_artifact):
