@@ -16,7 +16,7 @@ if [ "$#" -eq 0 ] || [ "$1" = "shell" ]; then
       :
     else
       rc=$?
-      echo "Command failed with exit code $rc (shell stays open)"
+      echo "Command failed with exit code $rc"
     fi
   done
 fi

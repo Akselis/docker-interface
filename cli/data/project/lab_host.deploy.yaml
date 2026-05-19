@@ -21,7 +21,7 @@
 
   tasks:
     - name: Generate LAB_HOST_ID UUID when not provided
-      ansible.builtin.command: uuidgen
+      ansible.builtin.command: cat /proc/sys/kernel/random/uuid
       register: generated_lab_host_id
       changed_when: false
       when: lab_host_id is not defined or (lab_host_id | string | length == 0)
