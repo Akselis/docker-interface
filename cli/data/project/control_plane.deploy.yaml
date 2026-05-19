@@ -107,6 +107,10 @@
           - "{{ control_plane_rabbitmq_host_port }}:5672"
           - "{{ control_plane_rabbitmq_management_port }}:15672"
 
+    - name: Pull control plane API image
+      ansible.builtin.command: docker pull {{ control_plane_image }}
+      changed_when: true
+
     - name: Run control plane migrations
       community.docker.docker_container:
         name: control-plane-migrate

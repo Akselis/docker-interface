@@ -68,6 +68,37 @@ def _detect_control_plane_gateway_ip(
     return None
 
 
+def _rewrite_url_host_if_loopback(url: str, replacement_host: str) -> str:
+    try:
+        parsed_url = parse.urlsplit(url)
+    except Exception:
+        return url
+
+    original_host = parsed_url.hostname
+    if not isinstance(original_host, str) or not _is_loopback_host(original_host):
+        return url
+
+    userinfo = ""
+    if parsed_url.username:
+        userinfo = parsed_url.username
+        if parsed_url.password is not None:
+            userinfo = f"{userinfo}:{parsed_url.password}"
+        userinfo = f"{userinfo}@"
+
+    port_part = f":{parsed_url.port}" if parsed_url.port is not None else ""
+    new_netloc = f"{userinfo}{replacement_host}{port_part}"
+
+    return parse.urlunsplit(
+        (
+            parsed_url.scheme,
+            new_netloc,
+            parsed_url.path,
+            parsed_url.query,
+            parsed_url.fragment,
+        )
+    )
+
+
 def _iter_group_hosts(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
     hosts: dict[str, dict[str, Any]] = {}
     for group_obj in data.values():
@@ -665,6 +696,12 @@ def infra_bootstrap() -> None:
 @infra_bootstrap.command("control-plane")
 @click.option("--device", required=True, help="Device name in inventory or raw IP")
 @click.option("--api-key", "control_plane_api_key", required=True)
+@click.option(
+    "--image",
+    "control_plane_image",
+    default=CONTROL_PLANE_DEFAULT_IMAGE,
+    show_default=True,
+)
 @click.option("--port", "control_plane_port", default=8001, type=int, show_default=True)
 @click.option(
     "--db-password",
@@ -683,6 +720,7 @@ def infra_bootstrap() -> None:
 def bootstrap_control_plane(
     device: str,
     control_plane_api_key: str,
+    control_plane_image: str,
     control_plane_port: int,
     control_plane_db_password: str,
     rabbitmq_user: str,
@@ -710,7 +748,7 @@ def bootstrap_control_plane(
 
     deploy_vars = {
         **common_extravars,
-        "control_plane_image": CONTROL_PLANE_DEFAULT_IMAGE,
+        "control_plane_image": control_plane_image,
         "control_plane_api_key": control_plane_api_key,
         "control_plane_container_port": control_plane_port,
         "control_plane_host_port": control_plane_port,
@@ -752,6 +790,9 @@ def bootstrap_control_plane(
 @infra_bootstrap.command("lab-host")
 @click.option("--device", required=True, help="Device name in inventory or raw IP")
 @click.option("--api-key", "lab_host_api_key", required=True)
+@click.option(
+    "--image", "lab_host_image", default=LAB_HOST_DEFAULT_IMAGE, show_default=True
+)
 @click.option("--port", "lab_host_port", default=8000, type=int, show_default=True)
 @click.option("--host-id", "lab_host_id", default=None)
 @click.option(
@@ -783,6 +824,7 @@ def bootstrap_control_plane(
 def bootstrap_lab_host(
     device: str,
     lab_host_api_key: str,
+    lab_host_image: str,
     lab_host_port: int,
     lab_host_id: str | None,
     register_ip: str | None,
@@ -811,36 +853,6 @@ def bootstrap_lab_host(
     if not ok:
         raise click.ClickException(f"Docker setup failed: {msg}")
 
-    rabbitmq_url = (
-        cp_state.get("env", {}).get("RABBITMQ_URL")
-        if isinstance(cp_state.get("env"), dict)
-        else None
-    )
-    if not isinstance(rabbitmq_url, str) or not rabbitmq_url:
-        rabbitmq_url = "amqp://guest:guest@localhost:5672/%2F"
-
-    register_host_name = lab_host_id or f"lab-host-{target_host}"
-    id_artifact = os.path.join(
-        dir.ARTIFACTS_DIR,
-        f"lab_host_id_{_slugify_for_filename(target_host)}.txt",
-    )
-
-    deploy_vars = {
-        **common_extravars,
-        "lab_host_image": LAB_HOST_DEFAULT_IMAGE,
-        "lab_host_api_key": lab_host_api_key,
-        "lab_host_container_port": lab_host_port,
-        "lab_host_host_port": lab_host_port,
-        "lab_host_rabbitmq_url": rabbitmq_url,
-        "lab_host_id_output_file": id_artifact,
-    }
-    if lab_host_id:
-        deploy_vars["lab_host_id"] = lab_host_id
-
-    ok, msg = run_playbook("lab_host.deploy.yaml", deploy_vars)
-    if not ok:
-        raise click.ClickException(f"Lab host deploy failed: {msg}")
-
     ansible_host = str(host_vars.get("ansible_host") or target_host)
     register_host_value = register_ip or ansible_host
 
@@ -860,6 +872,48 @@ def bootstrap_lab_host(
                 "Pass --register-ip explicitly.",
                 fg="yellow",
             )
+
+    rabbitmq_url = (
+        cp_state.get("env", {}).get("RABBITMQ_URL")
+        if isinstance(cp_state.get("env"), dict)
+        else None
+    )
+    if not isinstance(rabbitmq_url, str) or not rabbitmq_url:
+        rabbitmq_url = "amqp://guest:guest@localhost:5672/%2F"
+
+    rewritten_rabbitmq_url = _rewrite_url_host_if_loopback(
+        rabbitmq_url,
+        register_host_value,
+    )
+    if rewritten_rabbitmq_url != rabbitmq_url:
+        rabbitmq_url = rewritten_rabbitmq_url
+        click.secho(
+            "Auto-rewrote RABBITMQ_URL host from loopback to "
+            f"{register_host_value} for lab-host reachability.",
+            fg="yellow",
+        )
+
+    register_host_name = lab_host_id or f"lab-host-{target_host}"
+    id_artifact = os.path.join(
+        dir.ARTIFACTS_DIR,
+        f"lab_host_id_{_slugify_for_filename(target_host)}.txt",
+    )
+
+    deploy_vars = {
+        **common_extravars,
+        "lab_host_image": lab_host_image,
+        "lab_host_api_key": lab_host_api_key,
+        "lab_host_container_port": lab_host_port,
+        "lab_host_host_port": lab_host_port,
+        "lab_host_rabbitmq_url": rabbitmq_url,
+        "lab_host_id_output_file": id_artifact,
+    }
+    if lab_host_id:
+        deploy_vars["lab_host_id"] = lab_host_id
+
+    ok, msg = run_playbook("lab_host.deploy.yaml", deploy_vars)
+    if not ok:
+        raise click.ClickException(f"Lab host deploy failed: {msg}")
 
     effective_lab_host_id = register_host_name
     if os.path.exists(id_artifact):
