@@ -1,32 +1,18 @@
 local:
-  hosts:
-    localhost:
-      ansible_connection: local
-      ansible_host: 127.0.0.1
+  hosts: {}
 control_plane:
   hosts:
-    localhost:
-      ansible_connection: local
-      ansible_host: 127.0.0.1
     192.168.0.14:
       ansible_host: 192.168.0.14
       ansible_user: anastasija
       ansible_ssh_private_key_file: /root/.ssh/evlab_ed25519
       ansible_ssh_common_args: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
 lab_hosts:
-  hosts:
-    localhost:
-      ansible_connection: local
-      ansible_host: 127.0.0.1
+  hosts: {}
 lan:
   hosts:
     192.168.0.14:
       ansible_host: 192.168.0.14
-      ansible_user: anastasija
-      ansible_ssh_private_key_file: /root/.ssh/evlab_ed25519
-      ansible_ssh_common_args: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-    192.168.0.1:
-      ansible_host: 192.168.0.1
       ansible_user: anastasija
       ansible_ssh_private_key_file: /root/.ssh/evlab_ed25519
       ansible_ssh_common_args: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null

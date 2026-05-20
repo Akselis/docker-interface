@@ -276,6 +276,39 @@ def _remove_hosts_from_inventory(hosts_to_remove: set[str]) -> None:
     i.yaml.dump()
 
 
+def _set_inventory_ssh_key_for_hosts(
+    hosts: set[str],
+    ssh_key_path: str,
+) -> None:
+    if not hosts:
+        return
+
+    resolved_key_path = os.path.expanduser(ssh_key_path)
+
+    i = inv.EvLabInventory()
+    data = i.yaml.data if isinstance(i.yaml.data, dict) else {}
+
+    for group_data in data.values():
+        if not isinstance(group_data, dict):
+            continue
+        group_hosts = group_data.get("hosts")
+        if not isinstance(group_hosts, dict):
+            continue
+
+        for host_name, host_vars_obj in group_hosts.items():
+            if host_name not in hosts:
+                continue
+            host_vars = host_vars_obj if isinstance(host_vars_obj, dict) else {}
+            host_vars["ansible_ssh_private_key_file"] = resolved_key_path
+            host_vars.setdefault(
+                "ansible_ssh_common_args",
+                "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+            )
+            group_hosts[host_name] = host_vars
+
+    i.yaml.dump()
+
+
 def _remove_hosts_from_state(state: InfraState, hosts_to_remove: set[str]) -> None:
     if not hosts_to_remove:
         return
@@ -779,6 +812,11 @@ def infra_status() -> None:
 @click.option("--terraform-workdir", default=None)
 @click.option("--terraform-workspace", default=None)
 @click.option("--terraform-var-file", default=None)
+@click.option(
+    "--ssh-key-path",
+    default=None,
+    help="Override SSH private key path for target device(s) during teardown",
+)
 @click.option("--auto-approve/--no-auto-approve", default=True, show_default=True)
 def infra_destroy(
     device: str | None,
@@ -788,6 +826,7 @@ def infra_destroy(
     terraform_workdir: str | None,
     terraform_workspace: str | None,
     terraform_var_file: str | None,
+    ssh_key_path: str | None,
     auto_approve: bool,
 ) -> None:
     state = InfraState()
@@ -836,6 +875,43 @@ def infra_destroy(
             )
 
     if target_hosts:
+        effective_ssh_key_path: str | None = None
+        explicit_ssh_key = isinstance(ssh_key_path, str) and bool(ssh_key_path.strip())
+
+        if explicit_ssh_key:
+            effective_ssh_key_path = ssh_key_path.strip()
+        else:
+            lan_state = state.data.get("lan") if isinstance(state.data, dict) else None
+            lan_ssh_key = (
+                lan_state.get("ssh_key_path")
+                if isinstance(lan_state, dict)
+                and isinstance(lan_state.get("ssh_key_path"), str)
+                and lan_state.get("ssh_key_path")
+                else None
+            )
+            if isinstance(lan_ssh_key, str) and lan_ssh_key:
+                effective_ssh_key_path = lan_ssh_key
+                click.secho(
+                    "Using LAN ssh_key_path from state for teardown: "
+                    f"{effective_ssh_key_path}",
+                    fg="yellow",
+                )
+
+        if isinstance(effective_ssh_key_path, str) and effective_ssh_key_path:
+            resolved_key = os.path.expanduser(effective_ssh_key_path)
+            if os.path.exists(resolved_key):
+                _set_inventory_ssh_key_for_hosts(target_hosts, effective_ssh_key_path)
+            elif explicit_ssh_key:
+                raise click.ClickException(
+                    f"SSH key path does not exist: {resolved_key}"
+                )
+            else:
+                click.secho(
+                    "LAN ssh_key_path from state does not exist in current runtime: "
+                    f"{resolved_key}. Continuing with current inventory SSH settings.",
+                    fg="yellow",
+                )
+
         resolved_become_password = _resolve_become_password(become_password)
         teardown_extravars: dict[str, Any] = {
             "keep_volumes": keep_volumes,
@@ -894,6 +970,35 @@ def infra_destroy(
 
     state.set_terraform({})
     click.secho("Infrastructure destroy complete.", fg="green")
+
+
+@infra.command("remove-device")
+@click.option(
+    "--device",
+    "devices",
+    multiple=True,
+    required=True,
+    help="Device name in inventory or raw IP. Repeat option to remove multiple devices.",
+)
+def infra_remove_device(devices: tuple[str, ...]) -> None:
+    state = InfraState()
+
+    hosts_to_remove: set[str] = set()
+    for device in devices:
+        resolved = _resolve_destroy_hosts(state, device)
+        hosts_to_remove.update(resolved)
+
+    if not hosts_to_remove:
+        click.secho("No matching devices found in CLI context.", fg="yellow")
+        return
+
+    _remove_hosts_from_inventory(hosts_to_remove)
+    _remove_hosts_from_state(state, hosts_to_remove)
+
+    click.secho(
+        f"Removed device(s) from CLI context: {', '.join(sorted(hosts_to_remove))}",
+        fg="green",
+    )
 
 
 @infra.group("bootstrap")
