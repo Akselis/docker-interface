@@ -388,6 +388,59 @@ def _resolve_destroy_hosts(state: InfraState, device: str | None) -> set[str]:
         raise click.ClickException(f"Device not found in CLI context: {device}")
 
 
+def _resolve_effective_ssh_key_path(
+    *,
+    state: InfraState,
+    explicit_ssh_key_path: str | None,
+    host_vars: dict[str, Any] | None = None,
+) -> str | None:
+    def _existing_path(candidate: str | None) -> str | None:
+        if not isinstance(candidate, str) or not candidate.strip():
+            return None
+        resolved = os.path.expanduser(candidate.strip())
+        return resolved if os.path.exists(resolved) else None
+
+    if isinstance(explicit_ssh_key_path, str) and explicit_ssh_key_path.strip():
+        resolved = _existing_path(explicit_ssh_key_path)
+        if resolved is None:
+            raise click.ClickException(
+                f"SSH key path does not exist: {os.path.expanduser(explicit_ssh_key_path.strip())}"
+            )
+        return resolved
+
+    inventory_key = None
+    if isinstance(host_vars, dict):
+        key_obj = host_vars.get("ansible_ssh_private_key_file")
+        inventory_key = key_obj if isinstance(key_obj, str) else None
+        resolved_inventory = _existing_path(inventory_key)
+        if resolved_inventory is not None:
+            return resolved_inventory
+
+    lan_state = state.data.get("lan") if isinstance(state.data, dict) else None
+    lan_key = (
+        lan_state.get("ssh_key_path")
+        if isinstance(lan_state, dict)
+        and isinstance(lan_state.get("ssh_key_path"), str)
+        else None
+    )
+    resolved_lan = _existing_path(lan_key)
+    if resolved_lan is not None:
+        click.secho(
+            f"Using LAN ssh_key_path from state: {resolved_lan}",
+            fg="yellow",
+        )
+        return resolved_lan
+
+    if isinstance(inventory_key, str) and inventory_key.strip():
+        raise click.ClickException(
+            "Inventory SSH key path is set but not accessible in current runtime: "
+            f"{os.path.expanduser(inventory_key)}. "
+            "Pass --ssh-key-path explicitly (or ensure that key file exists/mounted)."
+        )
+
+    return None
+
+
 def _control_plane_state_or_fail(state: InfraState) -> dict[str, Any]:
     cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
     if not isinstance(cp_state, dict) or not cp_state:
@@ -587,6 +640,28 @@ def _prune_and_remove_hosts_via_control_plane(control_plane: dict[str, Any]) -> 
         _call_control_plane_api(control_plane, "DELETE", f"/hosts/{host_id}")
 
 
+def _ensure_sudo_compatibility(
+    *,
+    target_host: str,
+    sudo_password: str,
+    ssh_key_path: str | None = None,
+) -> None:
+    extravars: dict[str, Any] = {
+        "target_host": target_host,
+        "sudo_password": sudo_password,
+    }
+    if isinstance(ssh_key_path, str) and ssh_key_path:
+        extravars["ansible_ssh_private_key_file"] = os.path.expanduser(ssh_key_path)
+        extravars.setdefault(
+            "ansible_ssh_common_args",
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        )
+
+    ok, msg = run_playbook("host.ensure.sudo_compat.yaml", extravars)
+    if not ok:
+        _raise_with_sudo_hint("Sudo compatibility check failed", msg)
+
+
 def _ensure_firewall_ports(
     *,
     target_host: str,
@@ -759,6 +834,18 @@ def infra_provision(
                 raise click.ClickException(
                     f"Failed to bootstrap ssh key on {device_entry}: {msg}"
                 )
+
+            try:
+                _ensure_sudo_compatibility(
+                    target_host=host_name,
+                    sudo_password=become_password,
+                    ssh_key_path=private_key,
+                )
+            except click.ClickException as exc:
+                _remove_hosts_from_inventory(provisioned_hosts)
+                raise click.ClickException(
+                    f"Failed to prepare sudo compatibility on {device_entry}: {exc}"
+                ) from exc
 
         state.set_provision_type(infra_type)
         state.data["lan"] = {
@@ -964,6 +1051,12 @@ def infra_destroy(
             "ansible_become_flags": "-H -S",
         }
 
+        effective_teardown_ssh_key = (
+            effective_ssh_key_path
+            if isinstance(effective_ssh_key_path, str) and effective_ssh_key_path
+            else None
+        )
+
         control_plane_target = (
             cp_state.get("target_host")
             if isinstance(cp_state, dict)
@@ -981,6 +1074,12 @@ def infra_destroy(
             ordered_targets.append(control_plane_target)
 
         for target_host in ordered_targets:
+            _ensure_sudo_compatibility(
+                target_host=target_host,
+                sudo_password=resolved_become_password,
+                ssh_key_path=effective_teardown_ssh_key,
+            )
+
             ok, msg = run_playbook(
                 "host.teardown.containers.yaml",
                 {**teardown_extravars, "target_host": target_host},
@@ -1076,6 +1175,11 @@ def infra_bootstrap() -> None:
     hide_input=True,
 )
 @click.option(
+    "--ssh-key-path",
+    default=None,
+    help="Override SSH private key path for bootstrap connection",
+)
+@click.option(
     "--configure-firewall/--no-configure-firewall",
     default=True,
     show_default=True,
@@ -1089,12 +1193,18 @@ def bootstrap_control_plane(
     rabbitmq_user: str,
     rabbitmq_password: str,
     become_password: str | None,
+    ssh_key_path: str | None,
     configure_firewall: bool,
 ) -> None:
     state = InfraState()
     target_host, host_vars = _ensure_inventory_host("control_plane", device)
 
     resolved_become_password = _resolve_become_password(become_password, state)
+    effective_ssh_key_path = _resolve_effective_ssh_key_path(
+        state=state,
+        explicit_ssh_key_path=ssh_key_path,
+        host_vars=host_vars,
+    )
 
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
@@ -1102,6 +1212,18 @@ def bootstrap_control_plane(
         "ansible_become_pass": resolved_become_password,
         "ansible_become_flags": "-H -S",
     }
+    if isinstance(effective_ssh_key_path, str) and effective_ssh_key_path:
+        common_extravars["ansible_ssh_private_key_file"] = effective_ssh_key_path
+        common_extravars.setdefault(
+            "ansible_ssh_common_args",
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        )
+
+    _ensure_sudo_compatibility(
+        target_host=target_host,
+        sudo_password=resolved_become_password,
+        ssh_key_path=effective_ssh_key_path,
+    )
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
     if not ok:
@@ -1227,6 +1349,11 @@ def bootstrap_control_plane(
     help="Sudo password for privilege escalation on the target host",
     hide_input=True,
 )
+@click.option(
+    "--ssh-key-path",
+    default=None,
+    help="Override SSH private key path for bootstrap connection",
+)
 @click.option("--use-routing/--no-use-routing", default=False, show_default=True)
 @click.option("--ingress-image", default=INGRESS_DEFAULT_IMAGE, show_default=True)
 @click.option("--ingress-http-port", default=80, type=int, show_default=True)
@@ -1249,6 +1376,7 @@ def bootstrap_lab_host(
     dns_zone: str | None,
     ingress_target: str | None,
     become_password: str | None,
+    ssh_key_path: str | None,
     use_routing: bool,
     ingress_image: str,
     ingress_http_port: int,
@@ -1265,6 +1393,11 @@ def bootstrap_lab_host(
     target_host, host_vars = _ensure_inventory_host("lab_hosts", device)
 
     resolved_become_password = _resolve_become_password(become_password, state)
+    effective_ssh_key_path = _resolve_effective_ssh_key_path(
+        state=state,
+        explicit_ssh_key_path=ssh_key_path,
+        host_vars=host_vars,
+    )
 
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
@@ -1272,6 +1405,18 @@ def bootstrap_lab_host(
         "ansible_become_pass": resolved_become_password,
         "ansible_become_flags": "-H -S",
     }
+    if isinstance(effective_ssh_key_path, str) and effective_ssh_key_path:
+        common_extravars["ansible_ssh_private_key_file"] = effective_ssh_key_path
+        common_extravars.setdefault(
+            "ansible_ssh_common_args",
+            "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+        )
+
+    _ensure_sudo_compatibility(
+        target_host=target_host,
+        sudo_password=resolved_become_password,
+        ssh_key_path=effective_ssh_key_path,
+    )
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
     if not ok:

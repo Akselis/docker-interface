@@ -1,0 +1,67 @@
+---
+- hosts: "{{ target_host }}"
+  gather_facts: false
+  become: false
+
+  vars:
+    sudo_password: ""
+
+  tasks:
+    - name: Ensure sudo password is provided for compatibility check
+      ansible.builtin.assert:
+        that:
+          - sudo_password is defined
+          - sudo_password | string | length > 0
+        fail_msg: "Set sudo_password for sudo compatibility preparation."
+
+    - name: Detect sudo implementation
+      ansible.builtin.command: sudo --version
+      register: sudo_version
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether non-interactive sudo already works
+      ansible.builtin.command: sudo -n true
+      register: sudo_noninteractive
+      changed_when: false
+      failed_when: false
+
+    - name: Determine whether host uses sudo-rs
+      ansible.builtin.set_fact:
+        sudo_is_rs: "{{ 'sudo-rs' in (((sudo_version.stdout | default('')) ~ ' ' ~ (sudo_version.stderr | default(''))) | lower) }}"
+
+    - name: Configure NOPASSWD sudo for automation user when sudo-rs requires interactive prompt
+      ansible.builtin.shell: |
+        set -eu
+        user_name="{{ ansible_user | default('') }}"
+        if [ -z "$user_name" ]; then
+          user_name="$(id -un)"
+        fi
+
+        sudoers_file="/etc/sudoers.d/90-evlab-${user_name}-nopasswd"
+
+        printf '%s\n' "{{ sudo_password }}" | sudo -S -p '' sh -c "printf '%s ALL=(ALL) NOPASSWD:ALL\\n' '${user_name}' > '${sudoers_file}'"
+        printf '%s\n' "{{ sudo_password }}" | sudo -S -p '' chmod 440 "${sudoers_file}"
+
+        if command -v visudo >/dev/null 2>&1; then
+          printf '%s\n' "{{ sudo_password }}" | sudo -S -p '' visudo -cf "${sudoers_file}"
+        fi
+      no_log: true
+      when:
+        - sudo_is_rs | bool
+        - sudo_noninteractive.rc != 0
+
+    - name: Re-check non-interactive sudo after compatibility step
+      ansible.builtin.command: sudo -n true
+      register: sudo_noninteractive_after
+      changed_when: false
+      failed_when: false
+
+    - name: Fail when non-interactive sudo remains unavailable
+      ansible.builtin.fail:
+        msg: >-
+          Non-interactive sudo is unavailable on {{ inventory_hostname }}.
+          Detected sudo-rs={{ sudo_is_rs | default(false) }}.
+          Configure NOPASSWD for {{ ansible_user | default('current user') }}
+          or verify sudo policy/password.
+      when: sudo_noninteractive_after.rc != 0
