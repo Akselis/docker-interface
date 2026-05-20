@@ -198,8 +198,8 @@
         name: control-plane-migrate
         image: "{{ control_plane_image }}"
         state: started
-        auto_remove: true
         detach: false
+        cleanup: true
         command:
           - sh
           - /app/control_plane/scripts/migrate.sh

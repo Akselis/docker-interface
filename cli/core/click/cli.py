@@ -236,18 +236,30 @@ def _collect_context_hosts(state: InfraState) -> set[str]:
 
     cp = state.data.get("control_plane")
     if isinstance(cp, dict):
-        target_host = cp.get("target_host")
-        if isinstance(target_host, str) and target_host:
-            hosts.add(target_host)
+        for key in ("target_host", "host", "ansible_host"):
+            value = cp.get(key)
+            if isinstance(value, str) and value:
+                hosts.add(value)
 
     lab_hosts = state.data.get("lab_hosts")
     if isinstance(lab_hosts, dict):
-        for value in lab_hosts.values():
+        for host_key, value in lab_hosts.items():
+            if isinstance(host_key, str) and host_key:
+                hosts.add(host_key)
             if not isinstance(value, dict):
                 continue
-            target_host = value.get("target_host")
-            if isinstance(target_host, str) and target_host:
-                hosts.add(target_host)
+            for key in ("target_host", "ansible_host", "register_ip", "lab_host_id"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate:
+                    hosts.add(candidate)
+
+    lan = state.data.get("lan")
+    if isinstance(lan, dict):
+        devices = lan.get("devices")
+        if isinstance(devices, list):
+            for item in devices:
+                if isinstance(item, str) and item:
+                    hosts.add(item)
 
     return hosts
 
@@ -302,7 +314,13 @@ def _remove_hosts_from_inventory(hosts_to_remove: set[str]) -> None:
             continue
 
         for host_name in list(group_hosts.keys()):
-            if host_name in hosts_to_remove:
+            host_vars_obj = group_hosts.get(host_name)
+            host_vars = host_vars_obj if isinstance(host_vars_obj, dict) else {}
+            ansible_host = host_vars.get("ansible_host")
+
+            if host_name in hosts_to_remove or (
+                isinstance(ansible_host, str) and ansible_host in hosts_to_remove
+            ):
                 del group_hosts[host_name]
 
     i.yaml.dump()
@@ -341,23 +359,95 @@ def _set_inventory_ssh_key_for_hosts(
     i.yaml.dump()
 
 
+def _expand_host_identifiers(state: InfraState, hosts: set[str]) -> set[str]:
+    expanded = {item for item in hosts if isinstance(item, str) and item}
+    if not expanded:
+        return expanded
+
+    # Expand from inventory host key <-> ansible_host pairs
+    inventory = inv.EvLabInventory()
+    data = inventory.yaml.data if isinstance(inventory.yaml.data, dict) else {}
+    for group_data in data.values():
+        if not isinstance(group_data, dict):
+            continue
+        group_hosts = group_data.get("hosts")
+        if not isinstance(group_hosts, dict):
+            continue
+        for host_name, host_vars_obj in group_hosts.items():
+            if not isinstance(host_name, str):
+                continue
+            host_vars = host_vars_obj if isinstance(host_vars_obj, dict) else {}
+            ansible_host = host_vars.get("ansible_host")
+            if host_name in expanded or (
+                isinstance(ansible_host, str) and ansible_host in expanded
+            ):
+                expanded.add(host_name)
+                if isinstance(ansible_host, str) and ansible_host:
+                    expanded.add(ansible_host)
+
+    cp = state.data.get("control_plane") if isinstance(state.data, dict) else None
+    if isinstance(cp, dict):
+        cp_values = {
+            item
+            for item in (cp.get("target_host"), cp.get("host"), cp.get("ansible_host"))
+            if isinstance(item, str) and item
+        }
+        if expanded.intersection(cp_values):
+            expanded.update(cp_values)
+
+    lab_hosts = state.data.get("lab_hosts") if isinstance(state.data, dict) else None
+    if isinstance(lab_hosts, dict):
+        for host_key, host_value in lab_hosts.items():
+            values = {host_key} if isinstance(host_key, str) and host_key else set()
+            if isinstance(host_value, dict):
+                values.update(
+                    item
+                    for item in (
+                        host_value.get("target_host"),
+                        host_value.get("ansible_host"),
+                        host_value.get("register_ip"),
+                        host_value.get("lab_host_id"),
+                    )
+                    if isinstance(item, str) and item
+                )
+            if expanded.intersection(values):
+                expanded.update(values)
+
+    return expanded
+
+
 def _remove_hosts_from_state(state: InfraState, hosts_to_remove: set[str]) -> None:
     if not hosts_to_remove:
         return
 
+    expanded_hosts = _expand_host_identifiers(state, hosts_to_remove)
+
     cp = state.data.get("control_plane")
     if isinstance(cp, dict):
-        cp_target = cp.get("target_host")
-        if isinstance(cp_target, str) and cp_target in hosts_to_remove:
+        cp_values = {
+            item
+            for item in (cp.get("target_host"), cp.get("host"), cp.get("ansible_host"))
+            if isinstance(item, str) and item
+        }
+        if expanded_hosts.intersection(cp_values):
             state.data["control_plane"] = {}
 
     lab_hosts = state.data.get("lab_hosts")
     if isinstance(lab_hosts, dict):
         for host_key, host_value in list(lab_hosts.items()):
-            if not isinstance(host_value, dict):
-                continue
-            target_host = host_value.get("target_host")
-            if isinstance(target_host, str) and target_host in hosts_to_remove:
+            values = {host_key} if isinstance(host_key, str) and host_key else set()
+            if isinstance(host_value, dict):
+                values.update(
+                    item
+                    for item in (
+                        host_value.get("target_host"),
+                        host_value.get("ansible_host"),
+                        host_value.get("register_ip"),
+                        host_value.get("lab_host_id"),
+                    )
+                    if isinstance(item, str) and item
+                )
+            if expanded_hosts.intersection(values):
                 del lab_hosts[host_key]
 
     lan = state.data.get("lan")
@@ -367,7 +457,7 @@ def _remove_hosts_from_state(state: InfraState, hosts_to_remove: set[str]) -> No
             lan["devices"] = [
                 item
                 for item in devices
-                if isinstance(item, str) and item not in hosts_to_remove
+                if isinstance(item, str) and item not in expanded_hosts
             ]
 
     state.save()
@@ -383,6 +473,55 @@ def _resolve_destroy_hosts(state: InfraState, device: str | None) -> set[str]:
         host_name, _ = _resolve_device(i, device)
         return {host_name}
     except click.ClickException:
+        alias_resolved: set[str] = set()
+
+        cp = state.data.get("control_plane") if isinstance(state.data, dict) else None
+        if isinstance(cp, dict):
+            cp_target = cp.get("target_host")
+            cp_host = cp.get("host")
+            cp_ansible = cp.get("ansible_host")
+            candidates = {
+                item
+                for item in (cp_target, cp_host, cp_ansible)
+                if isinstance(item, str) and item
+            }
+            if device in candidates and isinstance(cp_target, str) and cp_target:
+                alias_resolved.add(cp_target)
+
+        lab_hosts = (
+            state.data.get("lab_hosts") if isinstance(state.data, dict) else None
+        )
+        if isinstance(lab_hosts, dict):
+            for host_key, host_value in lab_hosts.items():
+                if not isinstance(host_key, str) or not isinstance(host_value, dict):
+                    continue
+
+                target_host = host_value.get("target_host")
+                ansible_host = host_value.get("ansible_host")
+                register_ip = host_value.get("register_ip")
+                lab_host_id = host_value.get("lab_host_id")
+
+                candidates = {
+                    item
+                    for item in (
+                        host_key,
+                        target_host,
+                        ansible_host,
+                        register_ip,
+                        lab_host_id,
+                    )
+                    if isinstance(item, str) and item
+                }
+
+                if device in candidates:
+                    if isinstance(target_host, str) and target_host:
+                        alias_resolved.add(target_host)
+                    elif isinstance(ansible_host, str) and ansible_host:
+                        alias_resolved.add(ansible_host)
+
+        if alias_resolved:
+            return alias_resolved
+
         if device in context_hosts:
             return {device}
         raise click.ClickException(f"Device not found in CLI context: {device}")
