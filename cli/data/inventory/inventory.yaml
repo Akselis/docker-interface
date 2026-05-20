@@ -13,3 +13,10 @@ lab_hosts:
     localhost:
       ansible_connection: local
       ansible_host: 127.0.0.1
+lan:
+  hosts:
+    192.168.0.14:
+      ansible_host: 192.168.0.14
+      ansible_user: anastasija
+      ansible_ssh_private_key_file: /root/.ssh/evlab_ed25519
+      ansible_ssh_common_args: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
