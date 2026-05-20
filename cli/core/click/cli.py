@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import subprocess
 from typing import Any
 from urllib import error, parse, request
@@ -159,6 +160,27 @@ def _load_terraform_output(path: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _extract_ip_addresses_from_payload(payload: object) -> list[str]:
+    found: set[str] = set()
+
+    def _visit(value: object) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                _visit(item)
+            return
+        if isinstance(value, list):
+            for item in value:
+                _visit(item)
+            return
+        if isinstance(value, str):
+            candidate = value.strip()
+            if _is_ip(candidate):
+                found.add(candidate)
+
+    _visit(payload)
+    return sorted(found)
+
+
 def _ensure_local_ssh_keypair(private_key_path: str) -> tuple[str, str]:
     private_key = os.path.expanduser(private_key_path)
     public_key = f"{private_key}.pub"
@@ -188,6 +210,49 @@ def _parse_devices_csv(devices: str) -> list[str]:
     return [item.strip() for item in devices.split(",") if item.strip()]
 
 
+def _state_devices(state: InfraState) -> dict[str, Any]:
+    devices = state.data.get("devices") if isinstance(state.data, dict) else None
+    return devices if isinstance(devices, dict) else {}
+
+
+def _state_device_identifiers(device_key: str, device: dict[str, Any]) -> set[str]:
+    identifiers: set[str] = {device_key}
+
+    for field in ("ip_address", "name"):
+        value = device.get(field)
+        if isinstance(value, str) and value:
+            identifiers.add(value)
+
+    control_plane = device.get("control_plane")
+    if isinstance(control_plane, dict):
+        for field in ("target_host", "host", "ansible_host"):
+            value = control_plane.get(field)
+            if isinstance(value, str) and value:
+                identifiers.add(value)
+
+    lab_host = device.get("lab_host")
+    if isinstance(lab_host, dict):
+        for field in ("target_host", "ansible_host", "register_ip", "lab_host_id"):
+            value = lab_host.get(field)
+            if isinstance(value, str) and value:
+                identifiers.add(value)
+
+    return identifiers
+
+
+def _state_first_lan_value(state: InfraState, key: str) -> str | None:
+    for _device_key, device in _state_devices(state).items():
+        if not isinstance(device, dict):
+            continue
+        lan_obj = device.get("lan")
+        if not isinstance(lan_obj, dict):
+            continue
+        value = lan_obj.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _resolve_become_password(
     provided_become_password: str | None,
     state: InfraState | None = None,
@@ -196,13 +261,7 @@ def _resolve_become_password(
         return provided_become_password
 
     if isinstance(state, InfraState):
-        lan_state = state.data.get("lan") if isinstance(state.data, dict) else None
-        stored = (
-            lan_state.get("become_password")
-            if isinstance(lan_state, dict)
-            and isinstance(lan_state.get("become_password"), str)
-            else None
-        )
+        stored = _state_first_lan_value(state, "become_password")
         if isinstance(stored, str) and stored:
             click.secho(
                 "Using stored LAN sudo password from CLI state. "
@@ -234,69 +293,12 @@ def _slugify_for_filename(value: str) -> str:
 def _collect_context_hosts(state: InfraState) -> set[str]:
     hosts: set[str] = set()
 
-    cp = state.data.get("control_plane")
-    if isinstance(cp, dict):
-        for key in ("target_host", "host", "ansible_host"):
-            value = cp.get(key)
-            if isinstance(value, str) and value:
-                hosts.add(value)
-
-    lab_hosts = state.data.get("lab_hosts")
-    if isinstance(lab_hosts, dict):
-        for host_key, value in lab_hosts.items():
-            if isinstance(host_key, str) and host_key:
-                hosts.add(host_key)
-            if not isinstance(value, dict):
-                continue
-            for key in ("target_host", "ansible_host", "register_ip", "lab_host_id"):
-                candidate = value.get(key)
-                if isinstance(candidate, str) and candidate:
-                    hosts.add(candidate)
-
-    lan = state.data.get("lan")
-    if isinstance(lan, dict):
-        devices = lan.get("devices")
-        if isinstance(devices, list):
-            for item in devices:
-                if isinstance(item, str) and item:
-                    hosts.add(item)
+    for device_key, device in _state_devices(state).items():
+        if not isinstance(device_key, str) or not isinstance(device, dict):
+            continue
+        hosts.update(_state_device_identifiers(device_key, device))
 
     return hosts
-
-
-def _inventory_devices_snapshot() -> list[dict[str, str]]:
-    inventory = inv.EvLabInventory()
-    data = inventory.yaml.data if isinstance(inventory.yaml.data, dict) else {}
-
-    devices: list[dict[str, str]] = []
-    for group_name, group_obj in data.items():
-        if not isinstance(group_name, str) or not isinstance(group_obj, dict):
-            continue
-
-        hosts_obj = group_obj.get("hosts")
-        if not isinstance(hosts_obj, dict):
-            continue
-
-        for host_name, host_vars_obj in hosts_obj.items():
-            if not isinstance(host_name, str):
-                continue
-
-            host_vars = host_vars_obj if isinstance(host_vars_obj, dict) else {}
-            ansible_host_obj = host_vars.get("ansible_host")
-            ansible_host = (
-                ansible_host_obj if isinstance(ansible_host_obj, str) else host_name
-            )
-
-            devices.append(
-                {
-                    "group": group_name,
-                    "name": host_name,
-                    "ansible_host": ansible_host,
-                }
-            )
-
-    devices.sort(key=lambda item: (item["group"], item["name"]))
-    return devices
 
 
 def _remove_hosts_from_inventory(hosts_to_remove: set[str]) -> None:
@@ -346,9 +348,15 @@ def _set_inventory_ssh_key_for_hosts(
             continue
 
         for host_name, host_vars_obj in group_hosts.items():
-            if host_name not in hosts:
-                continue
             host_vars = host_vars_obj if isinstance(host_vars_obj, dict) else {}
+            ansible_host_obj = host_vars.get("ansible_host")
+            ansible_host = (
+                ansible_host_obj if isinstance(ansible_host_obj, str) else None
+            )
+            if host_name not in hosts and (
+                not isinstance(ansible_host, str) or ansible_host not in hosts
+            ):
+                continue
             host_vars["ansible_ssh_private_key_file"] = resolved_key_path
             host_vars.setdefault(
                 "ansible_ssh_common_args",
@@ -364,7 +372,6 @@ def _expand_host_identifiers(state: InfraState, hosts: set[str]) -> set[str]:
     if not expanded:
         return expanded
 
-    # Expand from inventory host key <-> ansible_host pairs
     inventory = inv.EvLabInventory()
     data = inventory.yaml.data if isinstance(inventory.yaml.data, dict) else {}
     for group_data in data.values():
@@ -385,33 +392,12 @@ def _expand_host_identifiers(state: InfraState, hosts: set[str]) -> set[str]:
                 if isinstance(ansible_host, str) and ansible_host:
                     expanded.add(ansible_host)
 
-    cp = state.data.get("control_plane") if isinstance(state.data, dict) else None
-    if isinstance(cp, dict):
-        cp_values = {
-            item
-            for item in (cp.get("target_host"), cp.get("host"), cp.get("ansible_host"))
-            if isinstance(item, str) and item
-        }
-        if expanded.intersection(cp_values):
-            expanded.update(cp_values)
-
-    lab_hosts = state.data.get("lab_hosts") if isinstance(state.data, dict) else None
-    if isinstance(lab_hosts, dict):
-        for host_key, host_value in lab_hosts.items():
-            values = {host_key} if isinstance(host_key, str) and host_key else set()
-            if isinstance(host_value, dict):
-                values.update(
-                    item
-                    for item in (
-                        host_value.get("target_host"),
-                        host_value.get("ansible_host"),
-                        host_value.get("register_ip"),
-                        host_value.get("lab_host_id"),
-                    )
-                    if isinstance(item, str) and item
-                )
-            if expanded.intersection(values):
-                expanded.update(values)
+    for device_key, device in _state_devices(state).items():
+        if not isinstance(device_key, str) or not isinstance(device, dict):
+            continue
+        identifiers = _state_device_identifiers(device_key, device)
+        if expanded.intersection(identifiers):
+            expanded.update(identifiers)
 
     return expanded
 
@@ -421,46 +407,16 @@ def _remove_hosts_from_state(state: InfraState, hosts_to_remove: set[str]) -> No
         return
 
     expanded_hosts = _expand_host_identifiers(state, hosts_to_remove)
+    keys_to_remove: set[str] = set()
 
-    cp = state.data.get("control_plane")
-    if isinstance(cp, dict):
-        cp_values = {
-            item
-            for item in (cp.get("target_host"), cp.get("host"), cp.get("ansible_host"))
-            if isinstance(item, str) and item
-        }
-        if expanded_hosts.intersection(cp_values):
-            state.data["control_plane"] = {}
+    for device_key, device in _state_devices(state).items():
+        if not isinstance(device_key, str) or not isinstance(device, dict):
+            continue
+        identifiers = _state_device_identifiers(device_key, device)
+        if expanded_hosts.intersection(identifiers):
+            keys_to_remove.add(device_key)
 
-    lab_hosts = state.data.get("lab_hosts")
-    if isinstance(lab_hosts, dict):
-        for host_key, host_value in list(lab_hosts.items()):
-            values = {host_key} if isinstance(host_key, str) and host_key else set()
-            if isinstance(host_value, dict):
-                values.update(
-                    item
-                    for item in (
-                        host_value.get("target_host"),
-                        host_value.get("ansible_host"),
-                        host_value.get("register_ip"),
-                        host_value.get("lab_host_id"),
-                    )
-                    if isinstance(item, str) and item
-                )
-            if expanded_hosts.intersection(values):
-                del lab_hosts[host_key]
-
-    lan = state.data.get("lan")
-    if isinstance(lan, dict):
-        devices = lan.get("devices")
-        if isinstance(devices, list):
-            lan["devices"] = [
-                item
-                for item in devices
-                if isinstance(item, str) and item not in expanded_hosts
-            ]
-
-    state.save()
+    state.remove_device_keys(keys_to_remove)
 
 
 def _resolve_destroy_hosts(state: InfraState, device: str | None) -> set[str]:
@@ -470,57 +426,18 @@ def _resolve_destroy_hosts(state: InfraState, device: str | None) -> set[str]:
 
     i = inv.EvLabInventory()
     try:
-        host_name, _ = _resolve_device(i, device)
-        return {host_name}
+        host_name, host_vars = _resolve_device(i, device)
+        resolved = {host_name}
+        ansible_host_obj = host_vars.get("ansible_host")
+        if isinstance(ansible_host_obj, str) and ansible_host_obj:
+            resolved.add(ansible_host_obj)
+        return resolved
     except click.ClickException:
-        alias_resolved: set[str] = set()
-
-        cp = state.data.get("control_plane") if isinstance(state.data, dict) else None
-        if isinstance(cp, dict):
-            cp_target = cp.get("target_host")
-            cp_host = cp.get("host")
-            cp_ansible = cp.get("ansible_host")
-            candidates = {
-                item
-                for item in (cp_target, cp_host, cp_ansible)
-                if isinstance(item, str) and item
-            }
-            if device in candidates and isinstance(cp_target, str) and cp_target:
-                alias_resolved.add(cp_target)
-
-        lab_hosts = (
-            state.data.get("lab_hosts") if isinstance(state.data, dict) else None
-        )
-        if isinstance(lab_hosts, dict):
-            for host_key, host_value in lab_hosts.items():
-                if not isinstance(host_key, str) or not isinstance(host_value, dict):
-                    continue
-
-                target_host = host_value.get("target_host")
-                ansible_host = host_value.get("ansible_host")
-                register_ip = host_value.get("register_ip")
-                lab_host_id = host_value.get("lab_host_id")
-
-                candidates = {
-                    item
-                    for item in (
-                        host_key,
-                        target_host,
-                        ansible_host,
-                        register_ip,
-                        lab_host_id,
-                    )
-                    if isinstance(item, str) and item
-                }
-
-                if device in candidates:
-                    if isinstance(target_host, str) and target_host:
-                        alias_resolved.add(target_host)
-                    elif isinstance(ansible_host, str) and ansible_host:
-                        alias_resolved.add(ansible_host)
-
-        if alias_resolved:
-            return alias_resolved
+        matched = state.find_device(device)
+        if matched is not None:
+            device_key, device_obj = matched
+            if isinstance(device_obj, dict):
+                return _state_device_identifiers(device_key, device_obj)
 
         if device in context_hosts:
             return {device}
@@ -555,13 +472,7 @@ def _resolve_effective_ssh_key_path(
         if resolved_inventory is not None:
             return resolved_inventory
 
-    lan_state = state.data.get("lan") if isinstance(state.data, dict) else None
-    lan_key = (
-        lan_state.get("ssh_key_path")
-        if isinstance(lan_state, dict)
-        and isinstance(lan_state.get("ssh_key_path"), str)
-        else None
-    )
+    lan_key = _state_first_lan_value(state, "ssh_key_path")
     resolved_lan = _existing_path(lan_key)
     if resolved_lan is not None:
         click.secho(
@@ -581,7 +492,7 @@ def _resolve_effective_ssh_key_path(
 
 
 def _control_plane_state_or_fail(state: InfraState) -> dict[str, Any]:
-    cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
+    cp_state = state.get_control_plane()
     if not isinstance(cp_state, dict) or not cp_state:
         raise click.ClickException(
             "Control plane state is missing. Bootstrap control-plane first."
@@ -600,33 +511,29 @@ def _resolve_control_plane_host_id(state: InfraState, host_ref: str) -> int:
             raise click.ClickException("--host-id must be a positive integer")
         return host_id
 
-    lab_hosts = state.data.get("lab_hosts") if isinstance(state.data, dict) else None
-    if isinstance(lab_hosts, dict):
-        for host_key, host_value in lab_hosts.items():
-            if not isinstance(host_key, str) or not isinstance(host_value, dict):
-                continue
+    for device_key, device in _state_devices(state).items():
+        if not isinstance(device_key, str) or not isinstance(device, dict):
+            continue
+        lab_host_obj = device.get("lab_host")
+        if not isinstance(lab_host_obj, dict):
+            continue
 
-            candidates: set[str] = {host_key}
-            for key in ("lab_host_id", "target_host", "ansible_host", "register_ip"):
-                value = host_value.get(key)
-                if isinstance(value, str) and value:
-                    candidates.add(value)
+        candidates = _state_device_identifiers(device_key, device)
+        response_obj = lab_host_obj.get("register_response")
+        if isinstance(response_obj, dict):
+            host_obj = response_obj.get("host")
+            if isinstance(host_obj, dict):
+                hostname = host_obj.get("hostname")
+                ip_address = host_obj.get("ip_address")
+                host_id_obj = host_obj.get("id")
 
-            response_obj = host_value.get("register_response")
-            if isinstance(response_obj, dict):
-                host_obj = response_obj.get("host")
-                if isinstance(host_obj, dict):
-                    hostname = host_obj.get("hostname")
-                    ip_address = host_obj.get("ip_address")
-                    host_id_obj = host_obj.get("id")
+                if isinstance(hostname, str) and hostname:
+                    candidates.add(hostname)
+                if isinstance(ip_address, str) and ip_address:
+                    candidates.add(ip_address)
 
-                    if isinstance(hostname, str) and hostname:
-                        candidates.add(hostname)
-                    if isinstance(ip_address, str) and ip_address:
-                        candidates.add(ip_address)
-
-                    if ref in candidates and isinstance(host_id_obj, int):
-                        return host_id_obj
+                if ref in candidates and isinstance(host_id_obj, int):
+                    return host_id_obj
 
     raise click.ClickException(
         "Could not resolve --host-id. Use numeric control-plane host id or a known "
@@ -779,6 +686,77 @@ def _prune_and_remove_hosts_via_control_plane(control_plane: dict[str, Any]) -> 
         _call_control_plane_api(control_plane, "DELETE", f"/hosts/{host_id}")
 
 
+def _device_keys_for_identifiers(
+    state: InfraState,
+    identifiers: set[str],
+) -> set[str]:
+    expanded_hosts = _expand_host_identifiers(state, identifiers)
+    keys: set[str] = set()
+    for device_key, device in _state_devices(state).items():
+        if not isinstance(device_key, str) or not isinstance(device, dict):
+            continue
+        if expanded_hosts.intersection(_state_device_identifiers(device_key, device)):
+            keys.add(device_key)
+    return keys
+
+
+def _device_target_host(device: dict[str, Any], fallback_key: str) -> str:
+    control_plane = device.get("control_plane")
+    if isinstance(control_plane, dict):
+        for key in ("target_host", "ansible_host", "host"):
+            value = control_plane.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+    lab_host = device.get("lab_host")
+    if isinstance(lab_host, dict):
+        for key in ("target_host", "ansible_host", "register_ip"):
+            value = lab_host.get(key)
+            if isinstance(value, str) and value:
+                return value
+
+    ip_obj = device.get("ip_address")
+    if isinstance(ip_obj, str) and ip_obj:
+        return ip_obj
+
+    name_obj = device.get("name")
+    if isinstance(name_obj, str) and name_obj:
+        return name_obj
+
+    return fallback_key
+
+
+def _cleanup_device_local_artifacts(device: dict[str, Any]) -> None:
+    lab_host = device.get("lab_host")
+    if not isinstance(lab_host, dict):
+        return
+
+    artifact_keys = ("lab_host_id_artifact", "lab_host_port_artifact")
+    for key in artifact_keys:
+        value = lab_host.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            os.remove(value)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+
+
+def _clear_local_cli_runtime_data() -> None:
+    for runtime_dir in (dir.ARTIFACTS_DIR, dir.ENV_DIR, dir.INVENTORY_DIR):
+        for entry in os.listdir(runtime_dir):
+            path = os.path.join(runtime_dir, entry)
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                else:
+                    os.remove(path)
+            except OSError:
+                continue
+
+
 def _ensure_sudo_compatibility(
     *,
     target_host: str,
@@ -857,6 +835,46 @@ def _load_json_from_args(
     return parsed
 
 
+def _load_text_from_path(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError as exc:
+        raise click.ClickException(f"Could not read file '{path}': {exc}") from exc
+
+
+def _parse_key_value_pairs(
+    values: tuple[str, ...], *, option_name: str
+) -> dict[str, str] | None:
+    if not values:
+        return None
+
+    parsed: dict[str, str] = {}
+    for raw_item in values:
+        item = raw_item.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise click.ClickException(
+                f"Invalid {option_name} entry '{raw_item}'. Use KEY=VALUE format."
+            )
+        key, value = item.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise click.ClickException(
+                f"Invalid {option_name} entry '{raw_item}'. Key cannot be empty."
+            )
+        parsed[key] = value
+
+    return parsed or None
+
+
+def _parse_csv_items(value: str | None) -> list[str] | None:
+    if value is None:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 @click.group()
 def cli() -> None:
     pass
@@ -887,6 +905,7 @@ def infra(ctx: click.Context, ansible_verbose: int) -> None:
 @click.option("--terraform-var-file", default="", show_default=True)
 @click.option("--auto-approve/--no-auto-approve", default=True, show_default=True)
 @click.option("--devices", default="", help="Comma-separated LAN device IPs/hostnames")
+@click.option("--name", "device_name", default=None, help="Optional device alias")
 @click.option("--ssh-user", default="", help="SSH username for LAN bootstrap")
 @click.option("--ssh-key-path", default="~/.ssh/evlab_ed25519", show_default=True)
 def infra_provision(
@@ -896,6 +915,7 @@ def infra_provision(
     terraform_var_file: str,
     auto_approve: bool,
     devices: str,
+    device_name: str | None,
     ssh_user: str,
     ssh_key_path: str,
 ) -> None:
@@ -904,12 +924,23 @@ def infra_provision(
     if infra_type == "local":
         i = inv.EvLabInventory()
         i.group_insert("local")
+        effective_name = (
+            device_name.strip()
+            if isinstance(device_name, str) and device_name.strip()
+            else "localhost"
+        )
         i.host_insert_update(
-            host_name="localhost",
+            host_name=effective_name,
             group_name="local",
             host_vars={"ansible_connection": "local", "ansible_host": "127.0.0.1"},
         )
         state.set_provision_type(infra_type)
+        state.upsert_device(
+            ip_address="127.0.0.1",
+            provision_group="local",
+            name=(effective_name if effective_name != "localhost" else None),
+        )
+        state.save()
         click.secho(
             "Local infrastructure provisioned (inventory prepared).", fg="green"
         )
@@ -919,6 +950,14 @@ def infra_provision(
         device_list = _parse_devices_csv(devices)
         if not device_list:
             raise click.ClickException("--devices is required for --type lan")
+        if (
+            isinstance(device_name, str)
+            and device_name.strip()
+            and len(device_list) != 1
+        ):
+            raise click.ClickException(
+                "--name is supported for single-device LAN provision only"
+            )
 
         effective_user = ssh_user.strip() or click.prompt("SSH username", type=str)
         ssh_password = click.prompt("SSH password", hide_input=True, type=str)
@@ -944,8 +983,12 @@ def infra_provision(
 
         provisioned_hosts: set[str] = set()
 
-        for device_entry in device_list:
-            host_name = device_entry
+        for idx, device_entry in enumerate(device_list):
+            host_name = (
+                device_name.strip()
+                if idx == 0 and isinstance(device_name, str) and device_name.strip()
+                else device_entry
+            )
             host_vars = {
                 "ansible_host": device_entry,
                 "ansible_user": effective_user,
@@ -987,13 +1030,23 @@ def infra_provision(
                 ) from exc
 
         state.set_provision_type(infra_type)
-        state.data["lan"] = {
-            "devices": device_list,
-            "ssh_user": effective_user,
-            "ssh_key_path": private_key,
-            "become_password": become_password,
-        }
-        state.save()
+        state.set_lan_for_devices(
+            devices=device_list,
+            ssh_user=effective_user,
+            ssh_key_path=private_key,
+            become_password=become_password,
+        )
+        if (
+            isinstance(device_name, str)
+            and device_name.strip()
+            and len(device_list) == 1
+        ):
+            state.upsert_device(
+                ip_address=device_list[0],
+                provision_group="lan",
+                name=device_name.strip(),
+            )
+            state.save()
 
         click.secho(
             "LAN infrastructure provision complete (SSH keys installed).", fg="green"
@@ -1025,6 +1078,29 @@ def infra_provision(
             "last_output": tf,
         }
     )
+
+    extracted_ips = _extract_ip_addresses_from_payload(tf)
+    for idx, ip in enumerate(extracted_ips):
+        device_obj = state.upsert_device(
+            ip_address=ip,
+            provision_group="cloud",
+            name=(
+                device_name.strip()
+                if idx == 0
+                and isinstance(device_name, str)
+                and device_name.strip()
+                and len(extracted_ips) == 1
+                else None
+            ),
+        )
+        if isinstance(device_obj, dict):
+            device_obj["terraform"] = {
+                "workspace": terraform_workspace,
+                "workdir": terraform_workdir,
+                "output_file": output_file,
+            }
+
+    state.save()
     click.secho("Infrastructure provision complete.", fg="green")
 
 
@@ -1059,9 +1135,84 @@ def infra_status() -> None:
         tf_state["last_output"] = tf_output
         state.set_terraform(tf_state)
 
-    payload = dict(state.data)
-    payload["devices"] = _inventory_devices_snapshot()
-    click.echo(json.dumps(payload, indent=2))
+    terraform_state = (
+        state.data.get("terraform") if isinstance(state.data, dict) else None
+    )
+
+    devices_payload: list[dict[str, Any]] = []
+    for device_key, device in _state_devices(state).items():
+        if not isinstance(device_key, str) or not isinstance(device, dict):
+            continue
+
+        ip_address_obj = device.get("ip_address")
+        ip_address = (
+            ip_address_obj
+            if isinstance(ip_address_obj, str) and ip_address_obj
+            else device_key
+        )
+
+        provision_group_obj = device.get("provision_group")
+        provision_group = (
+            provision_group_obj
+            if isinstance(provision_group_obj, str) and provision_group_obj
+            else provision_type
+        )
+
+        row: dict[str, Any] = {
+            "provision_group": provision_group,
+            "ip_address": ip_address,
+        }
+
+        name_obj = device.get("name")
+        if isinstance(name_obj, str) and name_obj:
+            row["name"] = name_obj
+
+        control_plane_obj = device.get("control_plane")
+        if isinstance(control_plane_obj, dict) and control_plane_obj:
+            row["control_plane"] = control_plane_obj
+
+        lab_host_obj = device.get("lab_host")
+        if isinstance(lab_host_obj, dict) and lab_host_obj:
+            row["lab_host"] = lab_host_obj
+
+        lan_obj = device.get("lan")
+        if isinstance(lan_obj, dict) and lan_obj:
+            lan_payload = {
+                key: value for key, value in lan_obj.items() if key != "become_password"
+            }
+            if lan_payload:
+                row["lan"] = lan_payload
+
+        terraform_obj = device.get("terraform")
+        if provision_group == "cloud":
+            if isinstance(terraform_obj, dict) and terraform_obj:
+                row["terraform"] = terraform_obj
+            elif isinstance(terraform_state, dict) and terraform_state:
+                row["terraform"] = terraform_state
+
+        devices_payload.append(row)
+
+    if (
+        not devices_payload
+        and provision_type == "cloud"
+        and isinstance(terraform_state, dict)
+        and terraform_state
+    ):
+        devices_payload.append(
+            {
+                "provision_group": "cloud",
+                "ip_address": "",
+                "terraform": terraform_state,
+            }
+        )
+
+    devices_payload.sort(
+        key=lambda item: (
+            str(item.get("ip_address") or ""),
+            str(item.get("name") or ""),
+        )
+    )
+    click.echo(json.dumps({"devices": devices_payload}, indent=2))
 
 
 @infra.command("destroy")
@@ -1124,25 +1275,16 @@ def infra_destroy(
             click.secho("Force destroy: no devices found in CLI context.", fg="yellow")
         return
 
-    cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
+    target_device_keys = _device_keys_for_identifiers(state, target_hosts)
+    target_devices = {
+        key: value
+        for key, value in _state_devices(state).items()
+        if isinstance(key, str)
+        and key in target_device_keys
+        and isinstance(value, dict)
+    }
 
-    if device is None and isinstance(cp_state, dict) and cp_state:
-        try:
-            click.secho(
-                "Destroying labs via control-plane API (containers, networks, volumes)...",
-                fg="yellow",
-            )
-            _destroy_all_labs_via_control_plane(cp_state)
-            click.secho(
-                "Pruning lab-host resources via control-plane API...", fg="yellow"
-            )
-            _prune_and_remove_hosts_via_control_plane(cp_state)
-        except click.ClickException as exc:
-            click.secho(
-                "Control-plane cleanup warning: "
-                f"{exc}. Continuing with direct host teardown from CLI context.",
-                fg="yellow",
-            )
+    destroyed_control_plane = False
 
     if target_hosts:
         effective_ssh_key_path: str | None = None
@@ -1151,14 +1293,7 @@ def infra_destroy(
         if explicit_ssh_key:
             effective_ssh_key_path = ssh_key_path.strip()
         else:
-            lan_state = state.data.get("lan") if isinstance(state.data, dict) else None
-            lan_ssh_key = (
-                lan_state.get("ssh_key_path")
-                if isinstance(lan_state, dict)
-                and isinstance(lan_state.get("ssh_key_path"), str)
-                and lan_state.get("ssh_key_path")
-                else None
-            )
+            lan_ssh_key = _state_first_lan_value(state, "ssh_key_path")
             if isinstance(lan_ssh_key, str) and lan_ssh_key:
                 effective_ssh_key_path = lan_ssh_key
                 click.secho(
@@ -1184,7 +1319,6 @@ def infra_destroy(
 
         resolved_become_password = _resolve_become_password(become_password, state)
         teardown_extravars: dict[str, Any] = {
-            "keep_volumes": keep_volumes,
             "ansible_become_password": resolved_become_password,
             "ansible_become_pass": resolved_become_password,
             "ansible_become_flags": "-H -S",
@@ -1196,42 +1330,150 @@ def infra_destroy(
             else None
         )
 
-        control_plane_target = (
-            cp_state.get("target_host")
-            if isinstance(cp_state, dict)
-            and isinstance(cp_state.get("target_host"), str)
-            else None
+        ordered_device_keys = sorted(
+            target_devices.keys(),
+            key=lambda item: (
+                1 if isinstance(target_devices[item].get("control_plane"), dict) else 0
+            ),
         )
 
-        ordered_targets = sorted(
-            host for host in target_hosts if host != control_plane_target
-        )
-        if (
-            isinstance(control_plane_target, str)
-            and control_plane_target in target_hosts
-        ):
-            ordered_targets.append(control_plane_target)
-
-        for target_host in ordered_targets:
-            _ensure_sudo_compatibility(
-                target_host=target_host,
-                sudo_password=resolved_become_password,
-                ssh_key_path=effective_teardown_ssh_key,
-            )
-
-            ok, msg = run_playbook(
-                "host.teardown.containers.yaml",
-                {**teardown_extravars, "target_host": target_host},
-            )
-            if not ok:
-                _raise_with_sudo_hint(
-                    f"Container teardown failed on {target_host}", msg
+        if not ordered_device_keys:
+            for target_host in sorted(target_hosts):
+                _ensure_sudo_compatibility(
+                    target_host=target_host,
+                    sudo_password=resolved_become_password,
+                    ssh_key_path=effective_teardown_ssh_key,
                 )
+
+                ok, msg = run_playbook(
+                    "host.teardown.containers.yaml",
+                    {
+                        **teardown_extravars,
+                        "target_host": target_host,
+                        "keep_volumes": keep_volumes,
+                    },
+                )
+                if not ok:
+                    _raise_with_sudo_hint(
+                        f"Container teardown failed on {target_host}",
+                        msg,
+                    )
+        else:
+            for device_key in ordered_device_keys:
+                device_obj = target_devices[device_key]
+                target_host = _device_target_host(device_obj, device_key)
+
+                _ensure_sudo_compatibility(
+                    target_host=target_host,
+                    sudo_password=resolved_become_password,
+                    ssh_key_path=effective_teardown_ssh_key,
+                )
+
+                has_lab_host = isinstance(device_obj.get("lab_host"), dict)
+                has_control_plane = isinstance(device_obj.get("control_plane"), dict)
+
+                if has_lab_host:
+                    ok, msg = run_playbook(
+                        "lab_host.teardown.yaml",
+                        {
+                            **teardown_extravars,
+                            "target_host": target_host,
+                            "remove_compose_data": not keep_volumes,
+                        },
+                    )
+                    if not ok:
+                        _raise_with_sudo_hint(
+                            f"Lab-host teardown failed on {target_host}",
+                            msg,
+                        )
+
+                if has_control_plane:
+                    cp_state_obj = device_obj.get("control_plane")
+                    if isinstance(cp_state_obj, dict):
+                        try:
+                            click.secho(
+                                "Destroying labs via control-plane API (containers, networks, volumes)...",
+                                fg="yellow",
+                            )
+                            _destroy_all_labs_via_control_plane(cp_state_obj)
+                            click.secho(
+                                "Pruning lab-host resources via control-plane API...",
+                                fg="yellow",
+                            )
+                            _prune_and_remove_hosts_via_control_plane(cp_state_obj)
+                        except click.ClickException as exc:
+                            click.secho(
+                                "Control-plane cleanup warning: "
+                                f"{exc}. Continuing with host teardown.",
+                                fg="yellow",
+                            )
+
+                    ok, msg = run_playbook(
+                        "control_plane.teardown.yaml",
+                        {
+                            **teardown_extravars,
+                            "target_host": target_host,
+                            "remove_volumes": True,
+                        },
+                    )
+                    if not ok:
+                        _raise_with_sudo_hint(
+                            f"Control-plane teardown failed on {target_host}",
+                            msg,
+                        )
+                    destroyed_control_plane = True
+
+                if not has_lab_host and not has_control_plane:
+                    ok, msg = run_playbook(
+                        "host.teardown.containers.yaml",
+                        {
+                            **teardown_extravars,
+                            "target_host": target_host,
+                            "keep_volumes": keep_volumes,
+                        },
+                    )
+                    if not ok:
+                        _raise_with_sudo_hint(
+                            f"Container teardown failed on {target_host}",
+                            msg,
+                        )
+
+            for device_obj in target_devices.values():
+                if isinstance(device_obj, dict):
+                    _cleanup_device_local_artifacts(device_obj)
 
         _remove_hosts_from_inventory(target_hosts)
         _remove_hosts_from_state(state, target_hosts)
 
-    provision_type = state.data.get("provision", {}).get("type")
+    provision_obj = state.data.get("provision") if isinstance(state.data, dict) else {}
+    provision_type = (
+        provision_obj.get("type")
+        if isinstance(provision_obj, dict)
+        and isinstance(provision_obj.get("type"), str)
+        else None
+    )
+
+    if provision_type not in {"local", "lan"}:
+        ok, msg = run_playbook(
+            "infra.destroy.yaml",
+            {
+                "terraform_workdir": workdir,
+                "terraform_workspace": workspace,
+                "terraform_var_file": var_file,
+                "terraform_auto_approve": auto_approve,
+            },
+        )
+        if not ok:
+            raise click.ClickException(msg)
+        state.set_terraform({})
+
+    if destroyed_control_plane:
+        _clear_local_cli_runtime_data()
+        state = InfraState()
+        state.reset()
+        click.secho("Infrastructure destroy complete.", fg="green")
+        return
+
     if provision_type in {"local", "lan"}:
         if target_hosts:
             click.secho("Infrastructure destroy complete.", fg="green")
@@ -1239,19 +1481,6 @@ def infra_destroy(
             click.secho("No devices found in CLI context to destroy.", fg="yellow")
         return
 
-    ok, msg = run_playbook(
-        "infra.destroy.yaml",
-        {
-            "terraform_workdir": workdir,
-            "terraform_workspace": workspace,
-            "terraform_var_file": var_file,
-            "terraform_auto_approve": auto_approve,
-        },
-    )
-    if not ok:
-        raise click.ClickException(msg)
-
-    state.set_terraform({})
     click.secho("Infrastructure destroy complete.", fg="green")
 
 
@@ -1433,7 +1662,10 @@ def bootstrap_control_plane(
     rabbitmq_url = f"amqp://{rabbitmq_user}:{rabbitmq_password}@{ansible_host}:{effective_rabbitmq_port}/%2F"
 
     state.set_control_plane(
-        {
+        ip_address=ansible_host,
+        provision_group=provision_type,
+        name=(target_host if target_host != ansible_host else None),
+        values={
             "target_host": target_host,
             "host": ansible_host,
             "ansible_host": ansible_host,
@@ -1448,7 +1680,7 @@ def bootstrap_control_plane(
                 "DB_URL": f"postgresql+asyncpg://control_plane:{control_plane_db_password}@control-plane-db:5432/control_plane",
                 "DOCKER_INTERFACE_API_KEY": control_plane_api_key,
             },
-        }
+        },
     )
 
     click.secho("Control plane bootstrap complete.", fg="green")
@@ -1523,11 +1755,7 @@ def bootstrap_lab_host(
     configure_firewall: bool,
 ) -> None:
     state = InfraState()
-    cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
-    if not isinstance(cp_state, dict) or not cp_state:
-        raise click.ClickException(
-            "Control plane state is missing. Bootstrap control-plane first."
-        )
+    cp_state = _control_plane_state_or_fail(state)
 
     target_host, host_vars = _ensure_inventory_host("lab_hosts", device)
 
@@ -1742,8 +1970,17 @@ def bootstrap_lab_host(
 
     register_response = _register_lab_host(cp_state, register_payload)
 
-    state.upsert_lab_host(
-        host_key=effective_lab_host_id,
+    provision = state.data.get("provision") if isinstance(state.data, dict) else {}
+    provision_type = (
+        provision.get("type")
+        if isinstance(provision, dict) and isinstance(provision.get("type"), str)
+        else None
+    )
+
+    state.set_lab_host(
+        ip_address=ansible_host,
+        provision_group=provision_type,
+        name=(target_host if target_host != ansible_host else None),
         values={
             "target_host": target_host,
             "ansible_host": ansible_host,
@@ -2161,21 +2398,208 @@ def control_plane_projects_get(lab_name: str, project_name: str) -> None:
     show_default=True,
     type=click.Choice(["first_fit", "least_allocated"]),
 )
+@click.option("--name", "project_name", default=None, help="Compose project name")
+@click.option(
+    "--source-type",
+    "--source",
+    "source_type",
+    default=None,
+    type=click.Choice(["git", "archive", "inline"]),
+    help="Compose source type",
+)
+@click.option(
+    "--source-url",
+    "--url",
+    "source_url",
+    default=None,
+    help="Source URL for git/archive source types",
+)
+@click.option("--ref", default=None, help="Git ref/branch/tag/commit")
+@click.option(
+    "--compose-file",
+    default=None,
+    help="Path to compose file inside source (defaults to docker-compose.yml)",
+)
+@click.option(
+    "--compose-inline",
+    "compose_inline",
+    default=None,
+    help="Inline compose YAML content (for source type inline)",
+)
+@click.option(
+    "--compose-inline-file",
+    default=None,
+    help="Path to file with compose YAML content (for source type inline)",
+)
+@click.option(
+    "--env",
+    "env_pairs",
+    multiple=True,
+    help="Compose process environment variable in KEY=VALUE format. Repeatable.",
+)
+@click.option(
+    "--pull/--no-pull",
+    default=None,
+    show_default=False,
+    help="Run docker compose pull before up",
+)
+@click.option(
+    "--build/--no-build",
+    default=None,
+    show_default=False,
+    help="Run docker compose up with --build",
+)
+@click.option(
+    "--network-mode",
+    default=None,
+    type=click.Choice(
+        [
+            "internal_private",
+            "internal_exposed",
+            "external_private",
+            "external_exposed",
+        ]
+    ),
+)
+@click.option(
+    "--exposed-services",
+    default=None,
+    help="Comma-separated compose service names to expose via ingress",
+)
+@click.option(
+    "--lifetime-type",
+    default=None,
+    type=click.Choice(["persistent", "ephemeral", "single_use", "session"]),
+)
+@click.option("--time-to-live-seconds", default=None, type=int)
+@click.option("--cpu-limit", default=None, type=float)
+@click.option("--memory-limit", default=None)
 @click.option("--json", "json_str", default=None, help="Inline JSON object payload")
 @click.option("--json-file", default=None, help="Path to JSON object payload file")
 def control_plane_projects_deploy(
     lab_name: str | None,
     scheduling_method: str,
+    project_name: str | None,
+    source_type: str | None,
+    source_url: str | None,
+    ref: str | None,
+    compose_file: str | None,
+    compose_inline: str | None,
+    compose_inline_file: str | None,
+    env_pairs: tuple[str, ...],
+    pull: bool | None,
+    build: bool | None,
+    network_mode: str | None,
+    exposed_services: str | None,
+    lifetime_type: str | None,
+    time_to_live_seconds: int | None,
+    cpu_limit: float | None,
+    memory_limit: str | None,
     json_str: str | None,
     json_file: str | None,
 ) -> None:
     state = InfraState()
     cp_state = _control_plane_state_or_fail(state)
-    payload = _load_json_from_args(json_str, json_file)
-    if payload is None:
+
+    if compose_inline and compose_inline_file:
         raise click.ClickException(
-            "Project deploy requires --json or --json-file payload"
+            "Use either --compose-inline or --compose-inline-file, not both"
         )
+
+    compose_content = compose_inline
+    if compose_inline_file:
+        compose_content = _load_text_from_path(compose_inline_file)
+
+    payload = _load_json_from_args(json_str, json_file) or {}
+
+    env_payload = _parse_key_value_pairs(env_pairs, option_name="--env")
+    exposed_services_payload = _parse_csv_items(exposed_services)
+
+    if isinstance(project_name, str):
+        if not project_name.strip():
+            raise click.ClickException("--name cannot be empty")
+        payload["project_name"] = project_name.strip()
+    if isinstance(source_type, str) and source_type:
+        payload["source_type"] = source_type
+    if isinstance(source_url, str):
+        if not source_url.strip():
+            raise click.ClickException("--source-url cannot be empty")
+        payload["source_url"] = source_url.strip()
+    if isinstance(ref, str):
+        if not ref.strip():
+            raise click.ClickException("--ref cannot be empty")
+        payload["ref"] = ref.strip()
+    if isinstance(compose_file, str):
+        if not compose_file.strip():
+            raise click.ClickException("--compose-file cannot be empty")
+        payload["compose_file"] = compose_file.strip()
+    if compose_content is not None:
+        payload["compose_content"] = compose_content
+    if env_payload is not None:
+        payload["env"] = env_payload
+    if pull is not None:
+        payload["pull"] = pull
+    if build is not None:
+        payload["build"] = build
+    if isinstance(network_mode, str) and network_mode:
+        payload["network_mode"] = network_mode
+    if exposed_services is not None:
+        payload["exposed_services"] = exposed_services_payload or []
+    if isinstance(lifetime_type, str) and lifetime_type:
+        payload["lifetime_type"] = lifetime_type
+    if time_to_live_seconds is not None:
+        payload["time_to_live_seconds"] = time_to_live_seconds
+    if cpu_limit is not None:
+        payload["cpu_limit"] = cpu_limit
+    if isinstance(memory_limit, str):
+        if not memory_limit.strip():
+            raise click.ClickException("--memory-limit cannot be empty")
+        payload["memory_limit"] = memory_limit.strip()
+
+    if not payload:
+        raise click.ClickException(
+            "Project deploy requires either --json/--json-file payload or explicit compose options"
+        )
+
+    project_name_obj = payload.get("project_name")
+    if not isinstance(project_name_obj, str) or not project_name_obj.strip():
+        raise click.ClickException(
+            "Project deploy payload requires non-empty project_name"
+        )
+    payload["project_name"] = project_name_obj.strip()
+
+    source_type_obj = payload.get("source_type")
+    if not isinstance(source_type_obj, str) or source_type_obj not in {
+        "git",
+        "archive",
+        "inline",
+    }:
+        raise click.ClickException(
+            "Project deploy payload requires source_type: git, archive, or inline"
+        )
+
+    compose_file_obj = payload.get("compose_file")
+    if compose_file_obj is None:
+        payload["compose_file"] = "docker-compose.yml"
+    elif not isinstance(compose_file_obj, str) or not compose_file_obj.strip():
+        raise click.ClickException("compose_file must be a non-empty string")
+    else:
+        payload["compose_file"] = compose_file_obj.strip()
+
+    if source_type_obj in {"git", "archive"}:
+        source_url_obj = payload.get("source_url")
+        if not isinstance(source_url_obj, str) or not source_url_obj.strip():
+            raise click.ClickException(
+                "Git/archive project deploy requires source_url (--source-url/--url)"
+            )
+        payload["source_url"] = source_url_obj.strip()
+
+    if source_type_obj == "inline":
+        compose_content_obj = payload.get("compose_content")
+        if not isinstance(compose_content_obj, str) or not compose_content_obj.strip():
+            raise click.ClickException(
+                "Inline project deploy requires compose_content (--compose-inline or --compose-inline-file)"
+            )
 
     if isinstance(lab_name, str) and lab_name:
         response = _call_control_plane_api(

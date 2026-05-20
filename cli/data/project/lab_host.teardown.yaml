@@ -1,0 +1,27 @@
+---
+- hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    lab_host_container_name: lab-host-api
+    ingress_container_name: lab-host-ingress
+    lab_host_compose_dir: /opt/lab_host/compose
+    remove_compose_data: false
+
+  tasks:
+    - name: Remove lab-host API container
+      ansible.builtin.command: docker rm -f {{ lab_host_container_name }}
+      changed_when: false
+      failed_when: false
+
+    - name: Remove ingress container
+      ansible.builtin.command: docker rm -f {{ ingress_container_name }}
+      changed_when: false
+      failed_when: false
+
+    - name: Remove compose data directory when requested
+      ansible.builtin.file:
+        path: "{{ lab_host_compose_dir }}"
+        state: absent
+      when: remove_compose_data

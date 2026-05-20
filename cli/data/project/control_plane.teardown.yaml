@@ -1,0 +1,48 @@
+---
+- hosts: "{{ target_host }}"
+  become: true
+  gather_facts: false
+
+  vars:
+    remove_volumes: true
+
+  tasks:
+    - name: List all docker containers
+      ansible.builtin.command: docker ps -aq
+      register: all_container_ids
+      changed_when: false
+      failed_when: false
+
+    - name: Remove all docker containers
+      ansible.builtin.command:
+        cmd: >-
+          docker rm -f
+          {% if remove_volumes %}-v{% endif %}
+          {{ item }}
+      loop: "{{ all_container_ids.stdout_lines }}"
+      when: all_container_ids.stdout_lines | length > 0
+      failed_when: false
+
+    - name: Prune docker networks
+      ansible.builtin.command: docker network prune -f
+      changed_when: false
+      failed_when: false
+
+    - name: Prune docker volumes
+      ansible.builtin.command: docker volume prune -f
+      when: remove_volumes
+      changed_when: false
+      failed_when: false
+
+    - name: Prune docker images
+      ansible.builtin.command: docker image prune -af
+      changed_when: false
+      failed_when: false
+
+    - name: Remove control-plane data directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /opt/control_plane
+        - /opt/lab_host
