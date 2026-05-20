@@ -188,11 +188,43 @@ def _parse_devices_csv(devices: str) -> list[str]:
     return [item.strip() for item in devices.split(",") if item.strip()]
 
 
-def _resolve_become_password(provided_become_password: str | None) -> str:
+def _resolve_become_password(
+    provided_become_password: str | None,
+    state: InfraState | None = None,
+) -> str:
     if isinstance(provided_become_password, str) and provided_become_password:
         return provided_become_password
 
+    if isinstance(state, InfraState):
+        lan_state = state.data.get("lan") if isinstance(state.data, dict) else None
+        stored = (
+            lan_state.get("become_password")
+            if isinstance(lan_state, dict)
+            and isinstance(lan_state.get("become_password"), str)
+            else None
+        )
+        if isinstance(stored, str) and stored:
+            click.secho(
+                "Using stored LAN sudo password from CLI state. "
+                "Override with --become-password if needed.",
+                fg="yellow",
+            )
+            return stored
+
     return click.prompt("Sudo password", hide_input=True, type=str)
+
+
+def _raise_with_sudo_hint(prefix: str, ansible_msg: str) -> None:
+    lowered = ansible_msg.lower()
+    if "waiting for privilege escalation prompt" in lowered:
+        raise click.ClickException(
+            f"{prefix}: {ansible_msg}. "
+            "Sudo escalation is failing on the target host. "
+            "Verify the sudo password/user on the host (sudo -k && sudo -v), "
+            "or pass --become-password explicitly."
+        )
+
+    raise click.ClickException(f"{prefix}: {ansible_msg}")
 
 
 def _slugify_for_filename(value: str) -> str:
@@ -578,11 +610,12 @@ def _ensure_firewall_ports(
             "target_host": target_host,
             "ansible_become_password": become_password,
             "ansible_become_pass": become_password,
+            "ansible_become_flags": "-H -S",
             "firewall_allow_tcp_ports": ports,
         },
     )
     if not ok:
-        raise click.ClickException(f"Firewall setup failed: {msg}")
+        _raise_with_sudo_hint("Firewall setup failed", msg)
 
 
 def _load_json_from_args(
@@ -912,11 +945,12 @@ def infra_destroy(
                     fg="yellow",
                 )
 
-        resolved_become_password = _resolve_become_password(become_password)
+        resolved_become_password = _resolve_become_password(become_password, state)
         teardown_extravars: dict[str, Any] = {
             "keep_volumes": keep_volumes,
             "ansible_become_password": resolved_become_password,
             "ansible_become_pass": resolved_become_password,
+            "ansible_become_flags": "-H -S",
         }
 
         control_plane_target = (
@@ -941,8 +975,8 @@ def infra_destroy(
                 {**teardown_extravars, "target_host": target_host},
             )
             if not ok:
-                raise click.ClickException(
-                    f"Container teardown failed on {target_host}: {msg}"
+                _raise_with_sudo_hint(
+                    f"Container teardown failed on {target_host}", msg
                 )
 
         _remove_hosts_from_inventory(target_hosts)
@@ -1049,17 +1083,18 @@ def bootstrap_control_plane(
     state = InfraState()
     target_host, host_vars = _ensure_inventory_host("control_plane", device)
 
-    resolved_become_password = _resolve_become_password(become_password)
+    resolved_become_password = _resolve_become_password(become_password, state)
 
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
         "ansible_become_password": resolved_become_password,
         "ansible_become_pass": resolved_become_password,
+        "ansible_become_flags": "-H -S",
     }
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
     if not ok:
-        raise click.ClickException(f"Docker setup failed: {msg}")
+        _raise_with_sudo_hint("Docker setup failed", msg)
 
     provision = state.data.get("provision") if isinstance(state.data, dict) else {}
     provision_type = (
@@ -1218,17 +1253,18 @@ def bootstrap_lab_host(
 
     target_host, host_vars = _ensure_inventory_host("lab_hosts", device)
 
-    resolved_become_password = _resolve_become_password(become_password)
+    resolved_become_password = _resolve_become_password(become_password, state)
 
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
         "ansible_become_password": resolved_become_password,
         "ansible_become_pass": resolved_become_password,
+        "ansible_become_flags": "-H -S",
     }
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
     if not ok:
-        raise click.ClickException(f"Docker setup failed: {msg}")
+        _raise_with_sudo_hint("Docker setup failed", msg)
 
     ansible_host = str(host_vars.get("ansible_host") or target_host)
     register_host_value = register_ip or ansible_host
