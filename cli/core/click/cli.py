@@ -649,8 +649,19 @@ def cli() -> None:
 
 
 @cli.group()
-def infra() -> None:
+@click.option(
+    "-v",
+    "--ansible-verbose",
+    count=True,
+    help="Increase ansible verbosity (-v up to -vvvv) for infra commands",
+)
+@click.pass_context
+def infra(ctx: click.Context, ansible_verbose: int) -> None:
     """Infrastructure lifecycle commands."""
+    if ansible_verbose > 0:
+        os.environ["EVLAB_ANSIBLE_VERBOSITY"] = str(min(ansible_verbose, 4))
+    else:
+        os.environ["EVLAB_ANSIBLE_VERBOSITY"] = "0"
 
 
 @infra.command("provision")
