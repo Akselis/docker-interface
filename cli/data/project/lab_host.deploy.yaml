@@ -20,6 +20,24 @@
           - lab_host_api_key | string | length > 0
         fail_msg: "Set lab_host_api_key when running this playbook."
 
+    - name: Ensure LAB_HOST_ID artifact directory exists on controller
+      ansible.builtin.file:
+        path: "{{ lab_host_id_output_file | dirname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      when: lab_host_id_output_file is defined and (lab_host_id_output_file | string | length > 0)
+
+    - name: Ensure LAB_HOST_PORT artifact directory exists on controller
+      ansible.builtin.file:
+        path: "{{ lab_host_port_output_file | dirname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      when: lab_host_port_output_file is defined and (lab_host_port_output_file | string | length > 0)
+
   tasks:
     - name: Generate LAB_HOST_ID UUID when not provided
       ansible.builtin.command: cat /proc/sys/kernel/random/uuid

@@ -41,6 +41,15 @@
           - control_plane_api_key | string | length > 0
         fail_msg: "Set control_plane_api_key when running this playbook."
 
+    - name: Ensure control plane ports artifact directory exists on controller
+      ansible.builtin.file:
+        path: "{{ control_plane_ports_output_file | dirname }}"
+        state: directory
+        mode: "0755"
+      delegate_to: localhost
+      become: false
+      when: control_plane_ports_output_file is defined and (control_plane_ports_output_file | string | length > 0)
+
   tasks:
     - name: Ensure control plane network exists
       community.docker.docker_network:

@@ -1,6 +1,8 @@
 #!/usr/bin/env sh
 set -e
 
+mkdir -p alembic/versions
+
 echo "[migrate] validating current alembic state"
 if ! alembic -c alembic.ini current >/tmp/alembic-current.log 2>&1; then
   if grep -q "Can't locate revision identified by" /tmp/alembic-current.log; then
