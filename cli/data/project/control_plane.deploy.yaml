@@ -211,7 +211,48 @@
         cleanup: true
         command:
           - sh
-          - /app/control_plane/scripts/migrate.sh
+          - -c
+          - |
+            set -e
+            cd /app/control_plane
+            mkdir -p alembic/versions
+
+            has_revisions="$(find alembic/versions -maxdepth 1 -type f -name '*.py' | wc -l | tr -d ' ')"
+            if [ "$has_revisions" -eq 0 ]; then
+              echo "[migrate] no committed revisions found; creating schema from models"
+              python - <<'PY'
+              import os
+              from sqlalchemy import create_engine
+              from sqlalchemy.engine import make_url
+              from db.models import Base
+
+              db_url = os.environ["DB_URL"]
+              parsed = make_url(db_url)
+
+              sync_driver_by_input_driver = {
+                  "postgresql": "postgresql+psycopg",
+                  "postgresql+asyncpg": "postgresql+psycopg",
+                  "postgresql+psycopg2": "postgresql+psycopg",
+                  "mysql": "mysql+pymysql",
+                  "mysql+aiomysql": "mysql+pymysql",
+                  "sqlite+aiosqlite": "sqlite",
+              }
+
+              if parsed.drivername in sync_driver_by_input_driver:
+                  parsed = parsed.set(drivername=sync_driver_by_input_driver[parsed.drivername])
+
+              sync_url = parsed.render_as_string(hide_password=False)
+              engine = create_engine(sync_url, pool_pre_ping=True)
+              try:
+                  Base.metadata.create_all(engine)
+              finally:
+                  engine.dispose()
+              PY
+
+              alembic -c alembic.ini stamp base >/tmp/alembic-stamp.log 2>&1 || true
+            else
+              sh /app/control_plane/scripts/migrate.sh
+            fi
         networks:
           - name: "{{ control_plane_network_name }}"
         env:
