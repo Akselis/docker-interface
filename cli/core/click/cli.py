@@ -474,6 +474,54 @@ def _register_lab_host(
     )
 
 
+def _destroy_all_labs_via_control_plane(control_plane: dict[str, Any]) -> None:
+    labs_response = _call_control_plane_api(control_plane, "GET", "/labs")
+    labs_obj = labs_response.get("labs") if isinstance(labs_response, dict) else None
+    labs = labs_obj if isinstance(labs_obj, list) else []
+
+    for lab in labs:
+        if not isinstance(lab, dict):
+            continue
+        lab_name = lab.get("name")
+        if not isinstance(lab_name, str) or not lab_name:
+            continue
+        _call_control_plane_api(control_plane, "DELETE", f"/labs/{lab_name}")
+
+
+def _prune_and_remove_hosts_via_control_plane(control_plane: dict[str, Any]) -> None:
+    hosts_response = _call_control_plane_api(control_plane, "GET", "/hosts")
+    hosts_obj = (
+        hosts_response.get("hosts") if isinstance(hosts_response, dict) else None
+    )
+    hosts = hosts_obj if isinstance(hosts_obj, list) else []
+
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        host_id = host.get("id")
+        if not isinstance(host_id, int):
+            continue
+
+        for endpoint in ("/containers/prune", "/networks/prune", "/volumes/prune"):
+            _call_control_plane_api(
+                control_plane,
+                "POST",
+                f"/hosts/{host_id}/call",
+                payload={
+                    "method": "POST",
+                    "endpoint_path": endpoint,
+                },
+            )
+
+    for host in hosts:
+        if not isinstance(host, dict):
+            continue
+        host_id = host.get("id")
+        if not isinstance(host_id, int):
+            continue
+        _call_control_plane_api(control_plane, "DELETE", f"/hosts/{host_id}")
+
+
 def _ensure_firewall_ports(
     *,
     target_host: str,
@@ -714,7 +762,7 @@ def infra_status() -> None:
     default=False,
     help="Skip teardown and only remove device(s) from CLI context",
 )
-@click.option("--keep-volumes/--remove-volumes", default=True, show_default=True)
+@click.option("--keep-volumes/--remove-volumes", default=False, show_default=True)
 @click.option(
     "--become-password",
     default=None,
@@ -760,13 +808,41 @@ def infra_destroy(
             click.secho("Force destroy: no devices found in CLI context.", fg="yellow")
         return
 
+    cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
+
+    if device is None and isinstance(cp_state, dict) and cp_state:
+        click.secho(
+            "Destroying labs via control-plane API (containers, networks, volumes)...",
+            fg="yellow",
+        )
+        _destroy_all_labs_via_control_plane(cp_state)
+        click.secho("Pruning lab-host resources via control-plane API...", fg="yellow")
+        _prune_and_remove_hosts_via_control_plane(cp_state)
+
     if target_hosts:
+        resolved_become_password = _resolve_become_password(become_password)
         teardown_extravars: dict[str, Any] = {
             "keep_volumes": keep_volumes,
-            "ansible_become_password": _resolve_become_password(become_password),
+            "ansible_become_password": resolved_become_password,
         }
 
-        for target_host in sorted(target_hosts):
+        control_plane_target = (
+            cp_state.get("target_host")
+            if isinstance(cp_state, dict)
+            and isinstance(cp_state.get("target_host"), str)
+            else None
+        )
+
+        ordered_targets = sorted(
+            host for host in target_hosts if host != control_plane_target
+        )
+        if (
+            isinstance(control_plane_target, str)
+            and control_plane_target in target_hosts
+        ):
+            ordered_targets.append(control_plane_target)
+
+        for target_host in ordered_targets:
             ok, msg = run_playbook(
                 "host.teardown.containers.yaml",
                 {**teardown_extravars, "target_host": target_host},

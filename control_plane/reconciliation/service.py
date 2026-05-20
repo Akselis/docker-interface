@@ -22,7 +22,6 @@ from db.repos.host import HostRepository
 from db.repos.lab import LabRepository
 from db.repos.project import ProjectRepository
 from db.session import session_scope
-from networking.providers import get_ingress_provider
 from secret_store import get_secret_store
 
 _RECONCILE_LOCK = Lock()
@@ -69,6 +68,7 @@ def _runtime_exit_code(container_payload: dict[str, object] | None) -> int | Non
 async def _delete_ingress_route_if_possible(
     *,
     host: Host,
+    api_key: str,
     lab_name: str,
     resource_name: str,
 ) -> None:
@@ -80,8 +80,12 @@ async def _delete_ingress_route_if_possible(
         lab_name=lab_name,
         base_domain=host.base_domain,
     )
-    ingress = get_ingress_provider()
-    await ingress.delete_route(hostname=fqdn)
+    await call_lab_host(
+        host=host,
+        api_key=api_key,
+        method="DELETE",
+        endpoint_path=f"/ingress/routes/{fqdn}",
+    )
 
 
 async def _resolve_host_api_key(host: Host) -> str | None:
@@ -139,6 +143,7 @@ async def _remove_container_row_and_runtime(
     )
     await _delete_ingress_route_if_possible(
         host=host,
+        api_key=api_key,
         lab_name=lab.name,
         resource_name=container_row.name,
     )
@@ -190,6 +195,7 @@ async def _reconcile_container(
             await container_repo.delete_row(row)
             await _delete_ingress_route_if_possible(
                 host=host,
+                api_key=api_key,
                 lab_name=lab.name,
                 resource_name=row.name,
             )
@@ -284,6 +290,7 @@ async def _remove_project_row_and_runtime(
     for service_name in project_repo.exposed_service_names(project_row):
         await _delete_ingress_route_if_possible(
             host=host,
+            api_key=api_key,
             lab_name=lab.name,
             resource_name=service_name,
         )

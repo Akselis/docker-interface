@@ -527,6 +527,13 @@ async def register_host(
     return {"status": "updated", "host": serialize_host(host)}
 
 
+@app.get("/hosts")
+async def get_hosts(session: AsyncSession = Depends(get_session)):
+    host_repo = HostRepository(session)
+    hosts = await host_repo.list_all()
+    return {"hosts": [serialize_host(host) for host in hosts]}
+
+
 @app.post("/hosts/{host_id}/call")
 async def call_lab_host_endpoint(
     host_id: int,
@@ -574,6 +581,20 @@ async def call_lab_host_endpoint(
         },
         "response": result,
     }
+
+
+@app.delete("/hosts/{host_id}")
+async def delete_host(
+    host_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    host_repo = HostRepository(session)
+    host = await host_repo.get_by_id(host_id)
+    if host is None:
+        raise HTTPException(status_code=404, detail=f"Host not found: {host_id}")
+
+    await host_repo.delete_by_host_id(host_id)
+    return {"status": "removed", "host_id": host_id}
 
 
 @app.get("/labs")

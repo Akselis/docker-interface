@@ -24,18 +24,6 @@ class EvLabInventory:
             self.yaml.data[parent_group_name]["children"][group_name] = {}
         self.yaml.dump()
 
-    def group_delete(self, group_name, parent_group_name=None):
-        if group_name in self.yaml.data and parent_group_name is None:
-            del self.yaml.data[group_name]
-            self.yaml.dump()
-        elif (
-            group_name in self.yaml.data
-            and parent_group_name is not None
-            and parent_group_name in self.yaml.data
-        ):
-            del self.yaml.data[parent_group_name]["children"][group_name]
-            self.yaml.dump()
-
     def host_insert_update(
         self, host_name, group_name, parent_group_name=None, host_vars=None
     ):
@@ -51,32 +39,4 @@ class EvLabInventory:
             self.yaml.data[group_name]["hosts"][host_name] = {}
         if host_vars is not None:
             self.yaml.data[group_name]["hosts"][host_name].update(host_vars)
-        self.yaml.dump()
-
-    def host_delete(self, host_name, group_name, parent_group_name=None):
-        if group_name in self.yaml.data and host_name in self.yaml.data[group_name]:
-            if parent_group_name is None:
-                del self.yaml.data[group_name]["hosts"][host_name]
-            elif (
-                parent_group_name in self.yaml.data
-                and group_name in self.yaml.data[parent_group_name]["children"]
-            ):
-                del self.yaml.data[parent_group_name]["children"][group_name]["hosts"][
-                    host_name
-                ]
-            self.yaml.dump()
-
-    def vars_insert(self, vars_name, group_name, parent_group_name=None, vars=None):
-        self.group_insert(group_name, parent_group_name)
-        if (
-            parent_group_name is not None
-            and "vars" not in self.yaml.data[parent_group_name][group_name]
-        ):
-            self.yaml.data[group_name]["vars"] = {}
-        elif parent_group_name is None and "vars" not in self.yaml.data[group_name]:
-            self.yaml.data[group_name]["vars"] = {}
-        if vars_name not in self.yaml.data[group_name]["vars"]:
-            self.yaml.data[group_name]["vars"][vars_name] = {}
-        if vars is not None:
-            self.yaml.data[group_name]["vars"][vars_name].update(vars)
         self.yaml.dump()

@@ -50,7 +50,7 @@ class PortMapping(BaseModel):
 
     @field_validator("host", "container")
     @classmethod
-    def validate_port(cls, v: int) -> int:
+    def validate_port(_cls, v: int) -> int:
         if not (1 <= v <= 65535):
             raise ValueError("Invalid port range")
         return v
@@ -129,14 +129,14 @@ class ComposeDeployArgs(BaseModel):
 
     @field_validator("cpu_limit")
     @classmethod
-    def validate_cpu_limit(cls, value: float | None) -> float | None:
+    def validate_cpu_limit(_cls, value: float | None) -> float | None:
         if value is not None and value <= 0:
             raise ValueError("cpu_limit must be greater than 0")
         return value
 
     @field_validator("memory_limit")
     @classmethod
-    def validate_memory_limit(cls, value: str | None) -> str | None:
+    def validate_memory_limit(_cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("memory_limit cannot be empty")
         return value

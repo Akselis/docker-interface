@@ -6,10 +6,6 @@ import ansible_runner
 import core.util.dir as dir
 
 
-class AnsibleRunError(RuntimeError):
-    pass
-
-
 def run_playbook(
     playbook: str, extravars: dict[str, Any] | None = None
 ) -> tuple[bool, str]:

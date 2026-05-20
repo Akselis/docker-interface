@@ -71,7 +71,7 @@ def _consume_forever() -> None:
     def _on_message(
         ch: Any,
         method: Any,
-        properties: Any,
+        _properties: Any,
         body: bytes,
     ) -> None:
         try:

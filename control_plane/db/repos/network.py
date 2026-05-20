@@ -1,21 +1,14 @@
 from __future__ import annotations
 
-from sqlalchemy import delete, select
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from db.models.network import Network
 from db.repos.generic import GenericRepository
+from sqlalchemy import delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class NetworkRepository(GenericRepository[Network]):
     def __init__(self, session: AsyncSession):
         super().__init__(session, Network)
-
-    async def get_by_network_id(self, network_id: str) -> Network | None:
-        result = await self.session.execute(
-            select(Network).where(Network.network_id == network_id)
-        )
-        return result.scalar_one_or_none()
 
     async def get_by_name(self, lab_id: int, network_name: str) -> Network | None:
         result = await self.session.execute(

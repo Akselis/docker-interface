@@ -21,7 +21,7 @@ class EvLabYAML:
         with open(self.file, "r") as f:
             self.data = self.yaml.load(f)
 
-    def dump(self, data=None, stream=None):
+    def dump(self, data=None, _stream=None):
         if data is None and self.data is not None:
             data = self.data
         elif self.data is None:

@@ -7,16 +7,22 @@
     keep_volumes: true
 
   tasks:
-    - name: List running docker containers
-      ansible.builtin.command: docker ps -q
-      register: running_container_ids
+    - name: List all docker containers (running and stopped)
+      ansible.builtin.command: docker ps -aq
+      register: all_container_ids
       changed_when: false
 
-    - name: Remove running docker containers
+    - name: Remove all docker containers
       ansible.builtin.command:
         cmd: >-
           docker rm -f
           {% if not keep_volumes %}-v{% endif %}
           {{ item }}
-      loop: "{{ running_container_ids.stdout_lines }}"
-      when: running_container_ids.stdout_lines | length > 0
+      loop: "{{ all_container_ids.stdout_lines }}"
+      when: all_container_ids.stdout_lines | length > 0
+
+    - name: Prune docker volumes when requested
+      ansible.builtin.command: docker volume prune -af
+      when: not keep_volumes
+      changed_when: false
+      failed_when: false

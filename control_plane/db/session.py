@@ -51,10 +51,6 @@ SessionFactory = async_sessionmaker(
 )
 
 
-async def create_session() -> AsyncSession:
-    return SessionFactory()
-
-
 async def get_session() -> AsyncIterator[AsyncSession]:
     async with SessionFactory() as session:
         yield session
@@ -76,15 +72,3 @@ async def session_scope() -> AsyncGenerator[AsyncSession, None]:
         except Exception:
             await session.rollback()
             raise
-
-
-async def begin_transaction(session: AsyncSession) -> None:
-    await session.begin()
-
-
-async def commit_transaction(session: AsyncSession) -> None:
-    await session.commit()
-
-
-async def rollback_transaction(session: AsyncSession) -> None:
-    await session.rollback()

@@ -30,7 +30,7 @@ class ContainerResourceArgs(BaseModel):
 
     @field_validator("cpu_count", "process_limit")
     @classmethod
-    def validate_positive_ints(cls, value: int | None) -> int | None:
+    def validate_positive_ints(_cls, value: int | None) -> int | None:
         if value is not None and value <= 0:
             raise ValueError("Value must be greater than 0")
         return value
@@ -63,7 +63,7 @@ class PortMapping(BaseModel):
 
     @field_validator("host", "container")
     @classmethod
-    def validate_port(cls, value: int) -> int:
+    def validate_port(_cls, value: int) -> int:
         if not (1 <= value <= 65535):
             raise ValueError("Invalid port range")
         return value
@@ -108,7 +108,7 @@ class DeployEnvironmentRequest(BaseModel):
 
     @field_validator("time_to_live_seconds")
     @classmethod
-    def validate_ttl(cls, value: int | None) -> int | None:
+    def validate_ttl(_cls, value: int | None) -> int | None:
         if value is not None and value <= 0:
             raise ValueError("time_to_live_seconds must be greater than 0")
         return value
@@ -174,21 +174,21 @@ class ComposeDeployRequest(BaseModel):
 
     @field_validator("cpu_limit")
     @classmethod
-    def validate_cpu_limit(cls, value: float | None) -> float | None:
+    def validate_cpu_limit(_cls, value: float | None) -> float | None:
         if value is not None and value <= 0:
             raise ValueError("cpu_limit must be greater than 0")
         return value
 
     @field_validator("memory_limit")
     @classmethod
-    def validate_memory_limit(cls, value: str | None) -> str | None:
+    def validate_memory_limit(_cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
             raise ValueError("memory_limit cannot be empty")
         return value
 
     @field_validator("time_to_live_seconds")
     @classmethod
-    def validate_ttl(cls, value: int | None) -> int | None:
+    def validate_ttl(_cls, value: int | None) -> int | None:
         if value is not None and value <= 0:
             raise ValueError("time_to_live_seconds must be greater than 0")
         return value

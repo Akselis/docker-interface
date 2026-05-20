@@ -956,10 +956,7 @@ def _ensure_ingress_layout() -> None:
         INGRESS_ROUTES_STATE_FILE.write_text("{}\n", encoding="utf-8")
 
     if not INGRESS_DYNAMIC_CONFIG_FILE.exists():
-        INGRESS_DYNAMIC_CONFIG_FILE.write_text(
-            "http:\n  routers: {}\n  services: {}\n",
-            encoding="utf-8",
-        )
+        INGRESS_DYNAMIC_CONFIG_FILE.write_text("", encoding="utf-8")
 
 
 def _load_ingress_routes_state() -> dict[str, dict[str, Any]]:
@@ -1019,7 +1016,7 @@ def _render_ingress_dynamic_config(routes: dict[str, dict[str, Any]]) -> str:
     lines: list[str] = ["http:", "  routers:"]
 
     if not routes:
-        return "http:\n  routers: {}\n  services: {}\n"
+        return ""
 
     for hostname in sorted(routes.keys()):
         route = routes[hostname]
