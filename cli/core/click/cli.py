@@ -544,6 +544,7 @@ def _ensure_firewall_ports(
         {
             "target_host": target_host,
             "ansible_become_password": become_password,
+            "ansible_become_pass": become_password,
             "firewall_allow_tcp_ports": ports,
         },
     )
@@ -608,7 +609,6 @@ def infra_provision(
     ssh_key_path: str,
 ) -> None:
     state = InfraState()
-    state.set_provision_type(infra_type)
 
     if infra_type == "local":
         i = inv.EvLabInventory()
@@ -618,6 +618,7 @@ def infra_provision(
             group_name="local",
             host_vars={"ansible_connection": "local", "ansible_host": "127.0.0.1"},
         )
+        state.set_provision_type(infra_type)
         click.secho(
             "Local infrastructure provisioned (inventory prepared).", fg="green"
         )
@@ -650,6 +651,8 @@ def infra_provision(
         inventory = inv.EvLabInventory()
         inventory.group_insert("lan")
 
+        provisioned_hosts: set[str] = set()
+
         for device_entry in device_list:
             host_name = device_entry
             host_vars = {
@@ -663,6 +666,7 @@ def infra_provision(
                 group_name="lan",
                 host_vars=host_vars,
             )
+            provisioned_hosts.add(host_name)
 
             ok, msg = run_playbook(
                 "lan.ssh.bootstrap.yaml",
@@ -674,10 +678,12 @@ def infra_provision(
                 },
             )
             if not ok:
+                _remove_hosts_from_inventory(provisioned_hosts)
                 raise click.ClickException(
                     f"Failed to bootstrap ssh key on {device_entry}: {msg}"
                 )
 
+        state.set_provision_type(infra_type)
         state.data["lan"] = {
             "devices": device_list,
             "ssh_user": effective_user,
@@ -706,6 +712,7 @@ def infra_provision(
         raise click.ClickException(msg)
 
     tf = _load_terraform_output(output_file)
+    state.set_provision_type(infra_type)
     state.set_terraform(
         {
             "workdir": terraform_workdir,
@@ -811,19 +818,29 @@ def infra_destroy(
     cp_state = state.data.get("control_plane") if isinstance(state.data, dict) else None
 
     if device is None and isinstance(cp_state, dict) and cp_state:
-        click.secho(
-            "Destroying labs via control-plane API (containers, networks, volumes)...",
-            fg="yellow",
-        )
-        _destroy_all_labs_via_control_plane(cp_state)
-        click.secho("Pruning lab-host resources via control-plane API...", fg="yellow")
-        _prune_and_remove_hosts_via_control_plane(cp_state)
+        try:
+            click.secho(
+                "Destroying labs via control-plane API (containers, networks, volumes)...",
+                fg="yellow",
+            )
+            _destroy_all_labs_via_control_plane(cp_state)
+            click.secho(
+                "Pruning lab-host resources via control-plane API...", fg="yellow"
+            )
+            _prune_and_remove_hosts_via_control_plane(cp_state)
+        except click.ClickException as exc:
+            click.secho(
+                "Control-plane cleanup warning: "
+                f"{exc}. Continuing with direct host teardown from CLI context.",
+                fg="yellow",
+            )
 
     if target_hosts:
         resolved_become_password = _resolve_become_password(become_password)
         teardown_extravars: dict[str, Any] = {
             "keep_volumes": keep_volumes,
             "ansible_become_password": resolved_become_password,
+            "ansible_become_pass": resolved_become_password,
         }
 
         control_plane_target = (
@@ -932,6 +949,7 @@ def bootstrap_control_plane(
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
         "ansible_become_password": resolved_become_password,
+        "ansible_become_pass": resolved_become_password,
     }
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
@@ -1100,6 +1118,7 @@ def bootstrap_lab_host(
     common_extravars: dict[str, Any] = {
         "target_host": target_host,
         "ansible_become_password": resolved_become_password,
+        "ansible_become_pass": resolved_become_password,
     }
 
     ok, msg = run_playbook("host.ensure.docker.yaml", common_extravars)
