@@ -575,9 +575,14 @@ def _call_control_plane_api(
     )
 
     try:
-        with request.urlopen(req, timeout=30) as resp:
+        with request.urlopen(req, timeout=180) as resp:
             content = resp.read().decode("utf-8")
             return json.loads(content) if content else {}
+    except TimeoutError as exc:
+        raise click.ClickException(
+            "Control plane request timed out after 180s. "
+            "The operation may still be running on the server; check resource state and retry if needed."
+        ) from exc
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise click.ClickException(
@@ -615,9 +620,14 @@ def _call_lab_host_api(
     )
 
     try:
-        with request.urlopen(req, timeout=30) as resp:
+        with request.urlopen(req, timeout=180) as resp:
             content = resp.read().decode("utf-8")
             return json.loads(content) if content else {}
+    except TimeoutError as exc:
+        raise click.ClickException(
+            "Lab-host request timed out after 180s. "
+            "The operation may still be running on the server; verify state and retry if needed."
+        ) from exc
     except error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise click.ClickException(
